@@ -134,20 +134,26 @@ def check_and_manage_open_positions(current_prices, all_historical_data, api_cli
     :param current_prices: Dict {ticker: current_price}
     :param all_historical_data: Dict {ticker: pd.DataFrame of historical prices} for signal re-evaluation
     :param api_client: Initialized Alpaca API client for placing orders.
+    :param alpaca_open_orders_map: Optional dict of {ticker: [AlpacaOrder]} from Alpaca.
     """
     positions = load_positions()
     if not positions:
         logger.log_action("Position Manager: No open positions to manage.")
         return
 
+    if alpaca_open_orders_map is None: # Ensure it's a dict for safe access
+        alpaca_open_orders_map = {}
+
     logger.log_action("Position Manager: Checking and managing open positions...")
     today = datetime.now()
     positions_updated = False # Flag to track if any position was changed
 
     for ticker, details in list(positions.items()): # Iterate over a copy for safe removal/modification
-        # Skip if position is already pending an exit
-        if details.get('status') == 'pending_exit':
-            logger.log_action(f"Position Manager: Position for {ticker} is already in 'pending_exit' status. Skipping management.")
+        # Skip if position is already pending an exit (unless we want to re-verify that order with alpaca_open_orders_map)
+        # For now, if positions.json says pending_exit, we trust it and trading_bot.py handles its status.
+        # This function's role is to decide IF an 'open' position needs an exit.
+        if details.get('status') != 'open': # Only manage 'open' positions
+            logger.log_action(f"Position Manager: Position for {ticker} is '{details.get('status', 'unknown_status')}', not 'open'. Skipping management decision here.")
             continue
 
         current_price = current_prices.get(ticker)
@@ -252,25 +258,54 @@ def check_and_manage_open_positions(current_prices, all_historical_data, api_cli
         # 3. Place Exit Order if a reason was determined
         if exit_reason:
             side_to_close = 'sell' if position_type == 'long' else 'buy'
-            logger.log_action(f"Position Manager: Attempting to place {side_to_close} order for {qty_to_close} {ticker} @ limit {current_price} due to: {exit_reason}")
 
-            exit_order = order_manager.place_limit_order(
-                ticker, qty_to_close, current_price, side_to_close, api_client=api_client
-            )
+            # Check Alpaca for existing open orders for this ticker that match the exit side
+            already_existing_exit_order = None
+            if ticker in alpaca_open_orders_map:
+                for order in alpaca_open_orders_map[ticker]:
+                    if order.side == side_to_close: # This is a potential pre-existing exit order
+                        logger.log_action(f"Position Manager: Found existing open Alpaca order for {ticker} (ID: {order.id}, Side: {order.side}, Qty: {order.qty}) that matches required exit side '{side_to_close}'.")
+                        already_existing_exit_order = order
+                        break # Found a suitable existing order
 
-            if exit_order and hasattr(exit_order, 'id'):
-                logger.log_action(f"Position Manager: Exit order {exit_order.id} placed for {ticker}. Status: {exit_order.status}")
-                # Update position details in the 'positions' dict (which is a copy being iterated)
-                positions[ticker]['status'] = 'pending_exit'
-                positions[ticker]['pending_exit_order_id'] = exit_order.id
-                positions[ticker]['pending_exit_order_placed_at'] = datetime.now().isoformat() # Or use order.created_at if available and preferred
-                positions[ticker]['exit_reason_for_order'] = exit_reason
-                exit_order_placed = True
-                positions_updated = True
+            if already_existing_exit_order:
+                logger.log_action(f"Position Manager: Using existing Alpaca order {already_existing_exit_order.id} as the exit order for {ticker}. No new order will be placed.")
+                # Ensure this existing order is tracked in positions.json
+                if positions[ticker].get('pending_exit_order_id') != already_existing_exit_order.id:
+                    positions[ticker]['status'] = 'pending_exit'
+                    positions[ticker]['pending_exit_order_id'] = already_existing_exit_order.id
+                    # Use submitted_at from order if available, else fallback
+                    submitted_at_iso = datetime.now().isoformat()
+                    if hasattr(already_existing_exit_order, 'submitted_at') and already_existing_exit_order.submitted_at:
+                        try:
+                            # AlpacaPy returns timezone-aware datetime, convert to ISO string
+                            submitted_at_iso = pd.to_datetime(already_existing_exit_order.submitted_at).isoformat()
+                        except Exception as e_ts:
+                            logger.log_action(f"Position Manager: Could not format submitted_at for order {already_existing_exit_order.id}: {e_ts}")
+
+                    positions[ticker]['pending_exit_order_placed_at'] = submitted_at_iso
+                    positions[ticker]['exit_reason_for_order'] = exit_reason # Update reason if new one triggered this
+                    positions_updated = True
+                exit_order_placed = True # Effectively, yes, as we are using an existing one.
             else:
-                logger.log_action(f"Position Manager: Failed to place exit order for {ticker} for reason: {exit_reason}. Will retry next run.")
+                # No suitable existing order found, proceed to place a new one
+                logger.log_action(f"Position Manager: Attempting to place {side_to_close} order for {qty_to_close} {ticker} @ limit {current_price} due to: {exit_reason}")
+                exit_order_obj = order_manager.place_limit_order(
+                    ticker, qty_to_close, current_price, side_to_close, api_client=api_client
+                )
 
-        # If an exit order was placed (either max hold or z-score), this iteration for the ticker is done.
+                if exit_order_obj and hasattr(exit_order_obj, 'id'):
+                    logger.log_action(f"Position Manager: Exit order {exit_order_obj.id} placed for {ticker}. Status: {exit_order_obj.status}")
+                    positions[ticker]['status'] = 'pending_exit'
+                    positions[ticker]['pending_exit_order_id'] = exit_order_obj.id
+                    positions[ticker]['pending_exit_order_placed_at'] = datetime.now().isoformat() # Or use order.created_at
+                    positions[ticker]['exit_reason_for_order'] = exit_reason
+                    exit_order_placed = True
+                    positions_updated = True
+                else:
+                    logger.log_action(f"Position Manager: Failed to place exit order for {ticker} for reason: {exit_reason}. Will retry next run.")
+
+        # If an exit order was placed or adopted, this iteration for the ticker is done.
         if exit_order_placed:
             continue # Move to the next ticker in the loop
 

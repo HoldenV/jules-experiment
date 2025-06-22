@@ -135,6 +135,40 @@ def cancel_order(order_id, api_client=None):
         logger.log_action(f"Order Manager: Generic error cancelling order {order_id}: {e}")
         return False
 
+def get_open_orders(api_client=None, tickers: list[str] = None):
+    """
+    Retrieves all open orders, optionally filtered by a list of tickers.
+    :param api_client: Optional initialized Alpaca API client. If None, uses module's client.
+    :param tickers: Optional list of stock tickers to filter orders by.
+                    If None or empty, open orders for all symbols are fetched.
+    :return: List of Order objects from Alpaca, or an empty list if error or no open orders.
+    """
+    current_api_client = api_client if api_client else _initialize_api_client()
+    if not current_api_client:
+        logger.log_action("Order Manager (get_open_orders): Alpaca API client not available.")
+        return []
+
+    try:
+        # API takes 'symbols' as a comma-separated string or list of strings.
+        # The SDK handles list of strings correctly.
+        params = {'status': 'open'}
+        if tickers:
+            params['symbols'] = tickers
+
+        open_orders = current_api_client.list_orders(**params)
+        count = len(open_orders)
+        if tickers:
+            logger.log_action(f"Order Manager: Found {count} open order(s) for tickers: {', '.join(tickers) if tickers else 'Any'}.")
+        else:
+            logger.log_action(f"Order Manager: Found {count} open order(s) for all symbols.")
+        return open_orders
+    except tradeapi.rest.APIError as e:
+        logger.log_action(f"Alpaca API Error getting open orders: {e}")
+        return []
+    except Exception as e:
+        logger.log_action(f"Order Manager: Generic error getting open orders: {e}")
+        return []
+
 if __name__ == '__main__':
     # Example usage:
     # IMPORTANT: These tests will interact with your Alpaca Paper Trading account if API keys are valid.
@@ -216,5 +250,31 @@ if __name__ == '__main__':
             print("Correctly failed to cancel invalid order ID.")
         else:
             print("Unexpectedly succeeded in cancelling an invalid order ID.")
+
+        # Test getting open orders
+        print("\nAttempting to fetch open orders (all symbols)...")
+        all_open_orders = get_open_orders(api_client=test_api_client)
+        if all_open_orders is not None: # Returns [] on error or no orders, which is fine
+            print(f"Found {len(all_open_orders)} open order(s) across all symbols.")
+            # for order in all_open_orders:
+            #     print(f"  - ID: {order.id}, Symbol: {order.symbol}, Qty: {order.qty}, Side: {order.side}, Status: {order.status}")
+        else:
+            # This case should ideally not be hit if errors return []
+            print("Error fetching all open orders or None was returned unexpectedly.")
+
+        # Test getting open orders for specific tickers (e.g., the one we might have just placed/cancelled)
+        # If the buy_order was successfully placed and then cancelled, it shouldn't appear here.
+        # This test is more meaningful if you manually have an open order for test_ticker.
+        print(f"\nAttempting to fetch open orders for ticker: {test_ticker}...")
+        ticker_specific_open_orders = get_open_orders(api_client=test_api_client, tickers=[test_ticker])
+        if ticker_specific_open_orders is not None:
+            print(f"Found {len(ticker_specific_open_orders)} open order(s) for {test_ticker}.")
+            # for order in ticker_specific_open_orders:
+            #     print(f"  - ID: {order.id}, Symbol: {order.symbol}, Qty: {order.qty}, Side: {order.side}, Status: {order.status}")
+            # If the test order was placed and not immediately filled/cancelled, it might show here.
+            # Depending on timing and market conditions, the test_order might be 'canceled' or 'new'/'pending_new'
+            # if the cancellation was processed after this check.
+            if buy_order and hasattr(buy_order, 'id') and any(o.id == buy_order.id for o in ticker_specific_open_orders):
+                print(f"Confirmed: Test order {buy_order.id} is among the open orders for {test_ticker} (this might indicate it wasn't cancelled yet or test setup needs adjustment).")
 
         print("\nOrder manager tests finished. Check main bot log (if configured) or console for detailed logs.")
