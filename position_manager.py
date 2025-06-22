@@ -17,6 +17,9 @@ def load_positions():
     Converts date strings back to datetime objects.
     :return: Dictionary of open positions {ticker: {details}}, or empty {} if file not found/error.
     """
+    # Ensure the positions directory exists before reading (for new runs)
+    os.makedirs(os.path.dirname(config.POSITIONS_FILE), exist_ok=True)
+
     if not os.path.exists(config.POSITIONS_FILE):
         return {}
     try:
@@ -41,6 +44,9 @@ def save_positions(positions):
     Converts datetime objects to ISO format strings for JSON serialization.
     :param positions: Dictionary of open positions {ticker: {details}}.
     """
+    # Ensure the positions directory exists before writing
+    os.makedirs(os.path.dirname(config.POSITIONS_FILE), exist_ok=True)
+
     try:
         positions_serializable = {}
         for ticker, details in positions.items():

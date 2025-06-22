@@ -1,3 +1,6 @@
+import os
+from datetime import datetime
+
 # --- Alpaca API Configuration ---
 # These should ideally be set in the .env file and loaded via os.getenv()
 # However, they are placed here as placeholders if not using .env for some reason.
@@ -52,27 +55,32 @@ Z_STOP_LOSS_SHORT = 3.0
 # Hardcoded list of stock tickers to trade.
 # In a more advanced system, this could be dynamically generated based on liquidity or other criteria.
 TICKERS = [
-    "AAPL", "MSFT", "GOOG", "AMZN", "TSLA", "NVDA", "BRK-A", "JPM", "JNJ", "V",
+    "AAPL", "MSFT", "GOOG", "AMZN", "TSLA", "NVDA", "JPM", "JNJ", "V",
     "PG", "UNH", "HD", "MA", "BAC", "DIS", "PYPL", "ADBE", "CMCSA", "XOM",
     "NFLX", "T", "CSCO", "PEP", "CVX", "ABT", "MRK", "PFE", "NKE", "KO",
     "MCD", "WMT", "CRM", "INTC", "VZ", "LLY", "ABBV", "NEE", "MDT", "COST",
-    "BMY", "HON", "LIN", "SBUX", "BLK", "AMT", "GS", "CAT", "AXP", "BA"
-    # Note: BRK-A might have very high price, affecting position sizing. Consider BRK-B.
+    "BMY", "HON", "LIN", "SBUX", "BLK", "AMT", "GS", "CAT", "AXP", "BA", "SOFI"
 ]
 
 
 # --- File Paths for Logging and State ---
 
-# Path to the main log file where bot actions and messages are recorded.
-LOG_FILE = "bot.log"
+# Directory for all logs and run outputs
+LOGS_DIR = os.path.join(os.path.dirname(__file__), 'logs')
+RUNS_DIR = os.path.join(LOGS_DIR, 'runs')
 
-# Path to the CSV file where details of completed trades are recorded.
-TRADES_CSV_FILE = "trades.csv"
+# Generate a timestamped run directory (e.g., logs/runs/2025-06-22_12-34-56)
+RUN_TIMESTAMP = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+CURRENT_RUN_DIR = os.path.join(RUNS_DIR, RUN_TIMESTAMP)
 
-# Path to the JSON file where current open positions and their metadata are stored.
-POSITIONS_FILE = "positions.json"
+# Path to the main log file for the current run
+LOG_FILE = os.path.join(CURRENT_RUN_DIR, 'bot.log')
 
-# Path to the JSON file for tracking entry orders placed within the current bot run.
-# This is mainly for 'day' Time-In-Force orders to check their fill status before the bot session ends.
-PENDING_ENTRY_ORDERS_TODAY_FILE = "pending_entry_orders_today.json" # Already defined in trading_bot.py, ensure consistency or move definition here.
-# For now, trading_bot.py defines its own constant for this. This could be centralized.
+# Path to the JSON file for current open positions for the current run
+POSITIONS_FILE = os.path.join(CURRENT_RUN_DIR, 'positions.json')
+
+# Path to the CSV file for completed trades (keep at top-level logs directory for summary, or move to run dir if desired)
+TRADES_CSV_FILE = os.path.join(LOGS_DIR, 'trades.csv')
+
+# Path to the JSON file for tracking entry orders placed within the current bot run
+PENDING_ENTRY_ORDERS_TODAY_FILE = os.path.join(CURRENT_RUN_DIR, 'pending_entry_orders_today.json')

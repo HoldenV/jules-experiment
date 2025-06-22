@@ -82,6 +82,9 @@ def save_pending_entry_orders(orders):
 
 
 def main():
+    # Ensure the current run directory exists before anything else
+    os.makedirs(config.CURRENT_RUN_DIR, exist_ok=True)
+
     """
     Main execution function for the trading bot.
     This function orchestrates the daily trading cycle.

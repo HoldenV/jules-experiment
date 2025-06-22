@@ -8,6 +8,9 @@ def log_action(message):
     Logs an action message to the bot's log file with a timestamp.
     :param message: The message string to log.
     """
+    # Ensure the log directory exists before writing
+    os.makedirs(os.path.dirname(config.LOG_FILE), exist_ok=True)
+
     timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     log_entry = f"{timestamp} - {message}\n"
     try:
@@ -29,6 +32,9 @@ def record_trade(ticker, entry_date, exit_date, entry_price, exit_price, profit_
     :param profit_loss: Profit or loss from the trade.
     :param reason_for_exit: Reason for closing the trade (e.g., "signal", "stop-loss", "max_duration").
     """
+    # Ensure the trades CSV directory exists before writing
+    os.makedirs(os.path.dirname(config.TRADES_CSV_FILE), exist_ok=True)
+
     file_exists = os.path.isfile(config.TRADES_CSV_FILE)
     fieldnames = ['Ticker', 'EntryDate', 'ExitDate', 'EntryPrice', 'ExitPrice', 'ProfitLoss', 'ExitReason']
 
