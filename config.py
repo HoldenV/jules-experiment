@@ -82,5 +82,10 @@ POSITIONS_FILE = os.path.join(CURRENT_RUN_DIR, 'positions.json')
 # Path to the CSV file for completed trades (keep at top-level logs directory for summary, or move to run dir if desired)
 TRADES_CSV_FILE = os.path.join(LOGS_DIR, 'trades.csv')
 
-# Path to the JSON file for tracking entry orders placed within the current bot run
-PENDING_ENTRY_ORDERS_TODAY_FILE = os.path.join(CURRENT_RUN_DIR, 'pending_entry_orders_today.json')
+# Path to the JSON file for tracking all pending orders (entry and exit) across bot runs
+# This file maintains the current state of pending orders across sessions.
+PENDING_ORDERS_FILE = os.path.join(LOGS_DIR, 'pending_orders.json')
+
+# Path to the JSON file for a snapshot of pending orders for the current run
+# This provides a historical record of pending orders at the time of each bot run.
+RUN_PENDING_ORDERS_FILE = os.path.join(CURRENT_RUN_DIR, 'pending_orders.json')

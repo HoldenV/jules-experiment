@@ -4,7 +4,7 @@
 import os
 import time # For potential delays if needed
 from datetime import datetime
-import json # For managing pending_entry_orders_today.json
+import json # For managing pending_orders.json
 import pandas as pd # For type hinting and z-score input preparation
 
 import alpaca_trade_api as tradeapi # For Alpaca API client initialization
@@ -18,9 +18,8 @@ import order_manager # For placing and managing orders
 import position_manager # For managing open positions and state
 import signal_generator # For generating trading signals
 
-# File to store IDs of entry orders placed in the current run.
-# This path will now be taken from config.py for consistency.
-# PENDING_ENTRY_ORDERS_FILE = "pending_entry_orders_today.json" # Old definition
+# File to store IDs of all pending orders (entry and exit) across bot runs.
+# This path is taken from config.py for consistency.
 
 def initialize_api_client():
     """
@@ -50,40 +49,53 @@ def initialize_api_client():
         logger.log_action(f"ERROR: Could not connect to Alpaca API: {e}")
         return None
 
-def load_pending_entry_orders():
+def load_pending_orders():
     """
-    Loads pending entry orders from the JSON file specified in config.
+    Loads all pending orders (entry and exit) from the JSON file specified in config.
     Returns an empty dictionary if the file doesn't exist or an error occurs.
     """
-    # Ensure the directory for the pending orders file exists (it's in CURRENT_RUN_DIR)
-    os.makedirs(os.path.dirname(config.PENDING_ENTRY_ORDERS_TODAY_FILE), exist_ok=True)
+    # Ensure the directory for the pending orders file exists (it's in LOGS_DIR)
+    os.makedirs(os.path.dirname(config.PENDING_ORDERS_FILE), exist_ok=True)
 
-    if not os.path.exists(config.PENDING_ENTRY_ORDERS_TODAY_FILE):
+    if not os.path.exists(config.PENDING_ORDERS_FILE):
         return {}
     try:
-        with open(config.PENDING_ENTRY_ORDERS_TODAY_FILE, 'r') as f:
+        with open(config.PENDING_ORDERS_FILE, 'r') as f:
             content = f.read()
             if not content: # Handle empty file
                 return {}
             return json.loads(content)
     except json.JSONDecodeError as e:
-        logger.log_action(f"Error decoding JSON from {config.PENDING_ENTRY_ORDERS_TODAY_FILE}: {e}. Returning empty dict.")
+        logger.log_action(f"Error decoding JSON from {config.PENDING_ORDERS_FILE}: {e}. Returning empty dict.")
         return {}
     except Exception as e:
-        logger.log_action(f"Error loading pending entry orders from {config.PENDING_ENTRY_ORDERS_TODAY_FILE}: {e}")
+        logger.log_action(f"Error loading pending orders from {config.PENDING_ORDERS_FILE}: {e}")
         return {}
 
-def save_pending_entry_orders(orders):
+def save_pending_orders(orders):
     """
-    Saves the given dictionary of pending entry orders to the JSON file specified in config.
+    Saves the given dictionary of pending orders to the JSON file specified in config.
     """
     # Ensure the directory for the pending orders file exists
-    os.makedirs(os.path.dirname(config.PENDING_ENTRY_ORDERS_TODAY_FILE), exist_ok=True)
+    os.makedirs(os.path.dirname(config.PENDING_ORDERS_FILE), exist_ok=True)
     try:
-        with open(config.PENDING_ENTRY_ORDERS_TODAY_FILE, 'w') as f:
+        with open(config.PENDING_ORDERS_FILE, 'w') as f:
             json.dump(orders, f, indent=4)
     except Exception as e:
-        logger.log_action(f"Error saving pending entry orders to {config.PENDING_ENTRY_ORDERS_TODAY_FILE}: {e}")
+        logger.log_action(f"Error saving pending orders to {config.PENDING_ORDERS_FILE}: {e}")
+
+def save_run_pending_orders_snapshot(orders):
+    """
+    Saves a snapshot of the current pending orders to a run-specific JSON file.
+    This provides a historical record for each bot run.
+    """
+    os.makedirs(os.path.dirname(config.RUN_PENDING_ORDERS_FILE), exist_ok=True)
+    try:
+        with open(config.RUN_PENDING_ORDERS_FILE, 'w') as f:
+            json.dump(orders, f, indent=4)
+        logger.log_action(f"Saved pending orders snapshot to {config.RUN_PENDING_ORDERS_FILE}")
+    except Exception as e:
+        logger.log_action(f"Error saving run-specific pending orders snapshot to {config.RUN_PENDING_ORDERS_FILE}: {e}")
 
 
 def main():
@@ -103,6 +115,46 @@ def main():
         logger.log_action("Exiting due to API client initialization failure.")
         logger.log_action(f"===== Trading Bot session ended prematurely at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} =====\n")
         return
+
+    # --- NEW STEP: Synchronize pending_orders.json with Alpaca's actual open orders ---
+    logger.log_action("Synchronizing pending_orders.json with live Alpaca open orders...")
+    local_pending_orders = load_pending_orders() # Load what we currently have in the file
+    alpaca_live_open_orders = order_manager.get_open_orders(api_client=api) # Fetch all open orders from Alpaca
+
+    # Create a new dictionary to hold the synchronized state
+    synchronized_pending_orders = {}
+
+    # First, add all live Alpaca orders. If they exist in local_pending_orders, use its metadata.
+    for alpaca_order in alpaca_live_open_orders:
+        order_id = alpaca_order.id
+        if order_id in local_pending_orders:
+            # If order exists locally, update its status and other relevant fields from live data
+            order_details = local_pending_orders[order_id]
+            order_details['status'] = alpaca_order.status
+            # Update other fields if necessary, e.g., filled_qty, filled_avg_price if partially filled
+            synchronized_pending_orders[order_id] = order_details
+        else:
+            # New order found on Alpaca, not previously tracked by the bot.
+            # Use submitted_at for placed_at, convert to ISO format
+            placed_at_iso = alpaca_order.submitted_at.isoformat() if alpaca_order.submitted_at else datetime.now().isoformat()
+
+            # Infer type based on side for external orders
+            inferred_type = f"alpaca_external_{alpaca_order.side}"
+
+            synchronized_pending_orders[order_id] = {
+                "ticker": alpaca_order.symbol,
+                "qty": float(alpaca_order.qty), # Ensure qty is float
+                "side": alpaca_order.side,
+                "limit_price": float(alpaca_order.limit_price) if alpaca_order.limit_price else None,
+                "type": inferred_type,
+                "placed_at": placed_at_iso,
+                "z_at_placement": None, # Cannot infer z-score for external orders
+                "status": alpaca_order.status
+            }
+        logger.log_action(f"Synchronized: Order {order_id} ({alpaca_order.symbol}) status: {alpaca_order.status}")
+
+    save_pending_orders(synchronized_pending_orders)
+    logger.log_action(f"Synchronization complete. {len(synchronized_pending_orders)} pending orders now tracked in {config.PENDING_ORDERS_FILE}.")
 
     # --- Step 1: Manage Existing Positions and Orders ---
     # This includes checking statuses of pending exit orders from previous runs.
@@ -246,7 +298,8 @@ def main():
         logger.log_action(f"Could not get PDT count from Alpaca API: {e}. Falling back to CSV method for estimation.")
         pdt_count = position_manager.get_pdt_trade_count() # Uses trades.csv as fallback
 
-    entry_orders_placed_this_run = {} # To store details of entry orders placed in this session
+    # Load all pending orders (entry and exit) from the persistent file
+    pending_orders = load_pending_orders()
 
     for ticker_symbol in all_tickers:
         # Ensure we have a current price for the ticker
@@ -330,70 +383,119 @@ def main():
 
             if entry_order and hasattr(entry_order, 'id'):
                 logger.log_action(f"Entry order {entry_order.id} ({order_side} {qty} {ticker_symbol}) placed. Status: {entry_order.status}")
-                entry_orders_placed_this_run[entry_order.id] = {
-                    "ticker": ticker_symbol, "qty": qty, "side": order_side,
-                    "limit_price": current_price, "type": "long" if signal == "BUY" else "short",
-                    "entry_time": datetime.now().isoformat(), # Record placement time
-                    "z_at_entry": current_z_score # Store z-score for future analysis/reference
+                # Add the newly placed entry order to the pending_orders dictionary
+                pending_orders[entry_order.id] = {
+                    "ticker": ticker_symbol,
+                    "qty": qty,
+                    "side": order_side,
+                    "limit_price": current_price,
+                    "type": "entry_long" if signal == "BUY" else "entry_short", # Differentiate entry/exit
+                    "placed_at": datetime.now().isoformat(), # Record placement time
+                    "z_at_placement": current_z_score, # Store z-score for future analysis/reference
+                    "status": entry_order.status # Initial status
                 }
                 available_cash -= estimated_cost # Notionally update available cash for subsequent checks in this loop
             else:
                 logger.log_action(f"Failed to place entry order for {ticker_symbol}.")
 
-    save_pending_entry_orders(entry_orders_placed_this_run) # Save orders placed in this run
+    # --- Step 5: Reconcile pending_orders.json with Alpaca's open orders ---
+    # This step will check all orders in pending_orders.json against Alpaca's current status
+    # and update/remove them as necessary.
+    logger.log_action("Step 5: Reconciling pending_orders.json with Alpaca's open orders...")
+    filled_any_new_entries = False # Flag to re-run position management if new entries filled
 
-    # --- Step 5: Check Status of Entry Orders Placed in THIS Run ---
-    # For 'day' TIF orders, this checks if they filled shortly after placement.
-    logger.log_action("Step 5: Checking status of new entry orders placed in this run...")
-    pending_entry_orders_today = load_pending_entry_orders() # Load what was just saved
-    filled_any_new_entries = False
+    # Fetch all open orders from Alpaca again to get the most current status
+    # This is crucial for persistent pending orders, as orders might have filled/cancelled
+    # between bot runs.
+    alpaca_current_open_orders = order_manager.get_open_orders(api_client=api)
+    alpaca_current_open_orders_map = {order.id: order for order in alpaca_current_open_orders}
 
-    # Optional: Short delay before checking, to allow orders to propagate/fill.
-    # if pending_entry_orders_today: time.sleep(5) # e.g., 5 seconds
+    orders_to_remove_from_pending = []
 
-    for order_id, order_details in list(pending_entry_orders_today.items()): # Use list() for safe modification
-        logger.log_action(f"Checking status of new entry order {order_id} for {order_details['ticker']}.")
-        # Pass the API client
-        order_status_obj = order_manager.get_order_status(order_id, api_client=api)
-        if order_status_obj:
-            if order_status_obj.status == 'filled':
-                try:
-                    fill_price = float(order_status_obj.filled_avg_price)
-                    # Use filled_qty from order status; if None (should not happen for filled), fallback to ordered qty.
-                    fill_qty = float(order_status_obj.filled_qty if order_status_obj.filled_qty is not None else order_details['qty'])
+    for order_id, order_details in list(pending_orders.items()): # Use list() for safe modification
+        ticker = order_details['ticker']
+        order_type = order_details['type'] # 'entry_long', 'entry_short', 'exit_long', 'exit_short'
 
-                    logger.log_action(f"New entry order {order_id} for {order_details['ticker']} FILLED. Qty: {fill_qty}, Avg Price: ${fill_price}.")
-
-                    # Determine entry_date from Alpaca's filled_at if available
-                    entry_fill_time = datetime.now()
-                    if hasattr(order_status_obj, 'filled_at') and order_status_obj.filled_at:
-                        entry_fill_time = pd.to_datetime(order_status_obj.filled_at).to_pydatetime() # Convert Panda Timestamp to python datetime
-
-                    position_manager.add_position(
-                        ticker=order_details['ticker'],
-                        qty=fill_qty,
-                        entry_price=fill_price,
-                        position_type=order_details['type'], # 'long' or 'short'
-                        entry_order_id=order_id,
-                        entry_date=entry_fill_time
-                    )
-                    filled_any_new_entries = True
-                    del pending_entry_orders_today[order_id] # Remove from pending list
-                except ValueError as ve:
-                     logger.log_action(f"Error converting fill data for new entry order {order_id} ({order_details['ticker']}): {ve}. Data: {order_status_obj}")
-                except Exception as ex:
-                    logger.log_action(f"Unexpected error processing filled new entry order {order_id} ({order_details['ticker']}): {ex}")
-
-
-            elif order_status_obj.status in ['expired', 'canceled', 'rejected', 'done_for_day']:
-                logger.log_action(f"New entry order {order_id} for {order_details['ticker']} is {order_status_obj.status}. Removing from today's pending list.")
-                del pending_entry_orders_today[order_id]
-            else: # e.g. 'new', 'accepted', 'partially_filled'
-                logger.log_action(f"New entry order {order_id} ({order_details['ticker']}) is still '{order_status_obj.status}'. (Day order - will likely expire if not filled by EOD).")
+        # Check if the order is still open on Alpaca
+        if order_id in alpaca_current_open_orders_map:
+            order_status_obj = alpaca_current_open_orders_map[order_id]
+            logger.log_action(f"Pending order {order_id} ({ticker}, {order_type}) is still '{order_status_obj.status}' on Alpaca.")
+            # Update status in our local pending_orders if it changed
+            pending_orders[order_id]['status'] = order_status_obj.status
         else:
-            logger.log_action(f"Could not get status for new entry order {order_id} ({order_details['ticker']}). Will assume it's still pending or failed for this run.")
+            # Order is not in Alpaca's open orders list, so it must be filled, cancelled, or expired.
+            # Fetch its status directly to confirm.
+            logger.log_action(f"Pending order {order_id} ({ticker}, {order_type}) not found in Alpaca's open orders. Checking final status...")
+            order_status_obj = order_manager.get_order_status(order_id, api_client=api)
 
-    save_pending_entry_orders(pending_entry_orders_today) # Save changes to the pending list
+            if order_status_obj:
+                if order_status_obj.status == 'filled':
+                    try:
+                        fill_price = float(order_status_obj.filled_avg_price)
+                        fill_qty = float(order_status_obj.filled_qty if order_status_obj.filled_qty is not None else order_details['qty'])
+
+                        logger.log_action(f"Pending order {order_id} ({ticker}, {order_type}) FILLED. Qty: {fill_qty}, Avg Price: ${fill_price}.")
+
+                        # Handle entry orders (both bot-placed and externally detected)
+                        if order_type.startswith('entry') or order_type.startswith('alpaca_external_'):
+                            entry_fill_time = datetime.now()
+                            if hasattr(order_status_obj, 'filled_at') and order_status_obj.filled_at:
+                                entry_fill_time = pd.to_datetime(order_status_obj.filled_at).to_pydatetime()
+
+                            # Determine position_type based on original order side or inferred type
+                            position_type = None
+                            if order_type == 'entry_long' or order_type == 'alpaca_external_buy':
+                                position_type = 'long'
+                            elif order_type == 'entry_short' or order_type == 'alpaca_external_sell':
+                                position_type = 'short'
+
+                            if position_type:
+                                position_manager.add_position(
+                                    ticker=ticker,
+                                    qty=fill_qty,
+                                    entry_price=fill_price,
+                                    position_type=position_type,
+                                    entry_order_id=order_id,
+                                    entry_date=entry_fill_time
+                                )
+                                filled_any_new_entries = True
+                            else:
+                                logger.log_action(f"WARNING: Could not determine position type for filled order {order_id} with type {order_type}. Not adding to positions.")
+                        elif order_type.startswith('exit'):
+                            exit_reason = order_details.get('exit_reason_for_order', 'automated_exit_filled')
+                            position_manager.remove_position(ticker, fill_price, exit_reason, order_id)
+
+                        orders_to_remove_from_pending.append(order_id) # Mark for removal
+                    except ValueError as ve:
+                        logger.log_action(f"Error converting fill data for pending order {order_id} ({ticker}, {order_type}): {ve}. Data: {order_status_obj}")
+                    except Exception as ex:
+                        logger.log_action(f"Unexpected error processing filled pending order {order_id} ({ticker}, {order_type}): {ex}")
+
+                elif order_status_obj.status in ['expired', 'canceled', 'rejected', 'done_for_day']:
+                    logger.log_action(f"Pending order {order_id} ({ticker}, {order_type}) is {order_status_obj.status}. Removing from pending list.")
+                    orders_to_remove_from_pending.append(order_id) # Mark for removal
+
+                else: # e.g. 'new', 'accepted', 'partially_filled' - still active but not yet filled
+                    logger.log_action(f"Pending order {order_id} ({ticker}, {order_type}) is still '{order_status_obj.status}'.")
+            else:
+                logger.log_action(f"Could not get status for pending order {order_id} ({ticker}, {order_type}). Assuming it's no longer active and removing from pending list.")
+                orders_to_remove_from_pending.append(order_id) # Assume removed if status can't be retrieved
+
+    # Remove processed orders from the pending_orders dictionary
+    for order_id in orders_to_remove_from_pending:
+        if order_id in pending_orders:
+            del pending_orders[order_id]
+
+    save_pending_orders(pending_orders) # Save updated pending orders list
+    save_run_pending_orders_snapshot(pending_orders) # Save a snapshot for the current run
+
+    # If a snapshot was successfully created, remove the overarching pending_orders.json file
+    if os.path.exists(config.RUN_PENDING_ORDERS_FILE):
+        try:
+            os.remove(config.PENDING_ORDERS_FILE)
+            logger.log_action(f"Removed {config.PENDING_ORDERS_FILE} as a snapshot was created.")
+        except OSError as e:
+            logger.log_action(f"Error removing {config.PENDING_ORDERS_FILE}: {e}")
 
     # If any new positions were opened, re-run management in case of immediate exit conditions (e.g., rapid reversal)
     if filled_any_new_entries:
@@ -408,18 +510,5 @@ def main():
 if __name__ == "__main__":
     # This script is designed to be run once per day as per the "Trade Schedule".
     # Actual scheduling (e.g., via cron or Windows Task Scheduler) is external.
-
-    # Clear the pending entry orders file from any previous (e.g., test) runs,
-    # using the path from config.py.
-    # In a robust production environment, one might inspect this file for orders
-    # from a crashed previous session instead of blindly deleting.
-    # Ensure the directory for the pending orders file exists before attempting to remove the file.
-    os.makedirs(os.path.dirname(config.PENDING_ENTRY_ORDERS_TODAY_FILE), exist_ok=True)
-    if os.path.exists(config.PENDING_ENTRY_ORDERS_TODAY_FILE):
-        logger.log_action(f"Clearing previous pending entry orders file: {config.PENDING_ENTRY_ORDERS_TODAY_FILE}")
-        try:
-            os.remove(config.PENDING_ENTRY_ORDERS_TODAY_FILE)
-        except OSError as e:
-            logger.log_action(f"Error removing {config.PENDING_ENTRY_ORDERS_TODAY_FILE}: {e}")
 
     main()

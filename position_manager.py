@@ -127,7 +127,7 @@ def remove_position(ticker, exit_price, exit_reason, exit_order_id=None):
     else:
         logger.log_action(f"Position Manager: Attempted to remove position for {ticker}, but it was not found.")
 
-def check_and_manage_open_positions(current_prices, all_historical_data, api_client): # Added api_client
+def check_and_manage_open_positions(current_prices, all_historical_data, api_client, alpaca_open_orders_map=None):
     """
     Manages open positions: checks for max holding period, stop-loss, exit signals.
     This function would typically be called daily.
