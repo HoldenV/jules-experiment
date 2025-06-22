@@ -2,58 +2,53 @@ import os
 from datetime import datetime
 
 # --- Alpaca API Configuration ---
-# These should ideally be set in the .env file and loaded via os.getenv()
-# However, they are placed here as placeholders if not using .env for some reason.
-# It's STRONGLY recommended to use .env for sensitive keys.
-ALPACA_API_KEY = "YOUR_ALPACA_API_KEY_IN_ENV" # Placeholder if .env is not used
-ALPACA_SECRET_KEY = "YOUR_ALPACA_SECRET_KEY_IN_ENV" # Placeholder if .env is not used
+# API keys are loaded from .env file in the bot. These are placeholders.
+ALPACA_API_KEY = "YOUR_ALPACA_API_KEY_IN_ENV"
+ALPACA_SECRET_KEY = "YOUR_ALPACA_SECRET_KEY_IN_ENV"
 
-# Specifies whether to use Alpaca's paper trading environment.
 # True for paper trading, False for live trading.
 ALPACA_PAPER = True
 
 # --- Trading Strategy Parameters ---
 
-# The number of most liquid U.S. stocks to consider in the universe.
-# Currently, the list of tickers is hardcoded. This parameter is for future use if a dynamic universe is implemented.
+# Number of most liquid U.S. stocks to consider (for future dynamic universe implementation).
 TOP_N_STOCKS = 50
 
-# The target dollar amount for each new position.
-# The actual number of shares will be calculated based on the current price.
+# Target dollar amount for each new position.
 POSITION_SIZE_USD = 100
 
-# Maximum number of calendar days to hold a position before exiting, regardless of other signals.
+# Maximum calendar days to hold a position.
 MAX_HOLDING_PERIOD_DAYS = 5
 
 
 # --- Z-Score Signal Parameters ---
 
-# The rolling window period (in days, assuming daily data) for calculating moving average and standard deviation.
+# Rolling window (days) for MA and STD calculation.
 Z_SCORE_WINDOW = 30
 
-# Z-score threshold to initiate a long position (current_z_score < Z_ENTRY_LONG).
+# Z-score threshold for long entry.
 Z_ENTRY_LONG = -1.5
 
-# Z-score threshold to initiate a short position (current_z_score > Z_ENTRY_SHORT).
+# Z-score threshold for short entry.
 Z_ENTRY_SHORT = 1.5
 
-# Z-score threshold to exit a long position when it reverts towards zero (current_z_score > Z_EXIT_LONG).
+# Z-score threshold for long exit (reversion to mean).
 Z_EXIT_LONG = -0.1
 
-# Z-score threshold to exit a short position when it reverts towards zero (current_z_score < Z_EXIT_SHORT).
+# Z-score threshold for short exit (reversion to mean).
 Z_EXIT_SHORT = 0.1
 
-# Z-score threshold for a stop-loss on a long position (current_z_score < Z_STOP_LOSS_LONG).
+# Z-score threshold for long position stop-loss.
 Z_STOP_LOSS_LONG = -3.0
 
-# Z-score threshold for a stop-loss on a short position (current_z_score > Z_STOP_LOSS_SHORT).
+# Z-score threshold for short position stop-loss.
 Z_STOP_LOSS_SHORT = 3.0
 
 
 # --- Stock Universe ---
 
-# Hardcoded list of stock tickers to trade.
-# In a more advanced system, this could be dynamically generated based on liquidity or other criteria.
+# List of stock tickers to trade.
+# TODO: Implement dynamic generation based on liquidity or other criteria.
 TICKERS = [
     "AAPL", "MSFT", "GOOG", "AMZN", "TSLA", "NVDA", "JPM", "JNJ", "V",
     "PG", "UNH", "HD", "MA", "BAC", "DIS", "PYPL", "ADBE", "CMCSA", "XOM",
