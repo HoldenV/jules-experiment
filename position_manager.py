@@ -82,17 +82,23 @@ def add_position(ticker, qty, entry_price, position_type, entry_order_id, entry_
         "entry_price": entry_price,
         "entry_date": entry_date, # Stored as datetime object in memory
         "type": position_type, # "long" or "short"
-        "pnl": 0.0 # Initial P&L
+        "status": "open", # Initialize status as 'open'
+        "entry_order_id": entry_order_id, # Store the entry order ID
+        "pnl": 0.0, # Initial P&L
+        "pending_exit_order_id": None, # Initialize placeholder for exit order
+        "pending_exit_order_placed_at": None,
+        "exit_reason_for_order": None
     }
     save_positions(positions)
-    logger.log_action(f"Added/Updated position: {qty} {ticker} @ {entry_price} ({position_type}) on {entry_date.strftime('%Y-%m-%d')}")
+    logger.log_action(f"Position Manager: Added new 'open' position: {qty} {ticker} @ {entry_price} ({position_type}) on {entry_date.strftime('%Y-%m-%d')}. Entry Order ID: {entry_order_id}")
 
-def remove_position(ticker, exit_price, exit_reason):
+def remove_position(ticker, exit_price, exit_reason, exit_order_id=None):
     """
-    Removes a position and records the trade.
+    Removes a position from the open positions file and records the trade.
     :param ticker: Stock ticker.
     :param exit_price: Price at which the position was exited.
-    :param exit_reason: String explaining why position was closed (e.g., "signal", "stop-loss", "max_hold").
+    :param exit_reason: String explaining why position was closed.
+    :param exit_order_id: Optional ID of the order that closed the position.
     """
     positions = load_positions()
     if ticker in positions:
@@ -114,29 +120,49 @@ def remove_position(ticker, exit_price, exit_reason):
             profit_loss,
             exit_reason
         )
-        logger.log_action(f"Closed position for {ticker}. Exit price: {exit_price}, Reason: {exit_reason}, P&L: {profit_loss:.2f}")
+        log_message = f"Position Manager: Closed position for {ticker}. Exit price: {exit_price}, Reason: {exit_reason}, P&L: {profit_loss:.2f}."
+        if exit_order_id:
+            log_message += f" Exit Order ID: {exit_order_id}."
+        logger.log_action(log_message)
     else:
-        logger.log_action(f"Attempted to remove position for {ticker}, but it was not found.")
+        logger.log_action(f"Position Manager: Attempted to remove position for {ticker}, but it was not found.")
 
-def check_and_manage_positions(current_prices, all_historical_data):
+def check_and_manage_open_positions(current_prices, all_historical_data, api_client): # Added api_client
     """
     Manages open positions: checks for max holding period, stop-loss, exit signals.
     This function would typically be called daily.
     :param current_prices: Dict {ticker: current_price}
     :param all_historical_data: Dict {ticker: pd.DataFrame of historical prices} for signal re-evaluation
+    :param api_client: Initialized Alpaca API client for placing orders.
     """
     positions = load_positions()
     if not positions:
+        logger.log_action("Position Manager: No open positions to manage.")
         return
 
-    logger.log_action("Checking and managing open positions...")
+    logger.log_action("Position Manager: Checking and managing open positions...")
     today = datetime.now()
+    positions_updated = False # Flag to track if any position was changed
 
-    for ticker, details in list(positions.items()): # Iterate over a copy for safe removal
+    for ticker, details in list(positions.items()): # Iterate over a copy for safe removal/modification
+        # Skip if position is already pending an exit
+        if details.get('status') == 'pending_exit':
+            logger.log_action(f"Position Manager: Position for {ticker} is already in 'pending_exit' status. Skipping management.")
+            continue
+
         current_price = current_prices.get(ticker)
         if current_price is None:
-            logger.log_action(f"Could not get current price for open position {ticker}. Skipping management for now.")
+            logger.log_action(f"Position Manager: Could not get current price for open position {ticker}. Skipping management for this ticker.")
             continue
+
+        if not isinstance(current_price, (int, float)) or current_price <= 0:
+            logger.log_action(f"Position Manager: Invalid current price ({current_price}) for open position {ticker}. Skipping management.")
+            continue
+
+        qty_to_close = details['qty']
+        position_type = details['type'] # 'long' or 'short'
+        exit_order_placed = False
+        exit_reason = None
 
         # 1. Check Max Holding Period
         entry_date = details['entry_date']
@@ -144,63 +170,117 @@ def check_and_manage_positions(current_prices, all_historical_data):
             entry_date = datetime.fromisoformat(entry_date)
 
         if (today - entry_date).days >= config.MAX_HOLDING_PERIOD_DAYS:
-            logger.log_action(f"Position {ticker} hit max holding period of {config.MAX_HOLDING_PERIOD_DAYS} days.")
-            # TODO: Implement order placement to close position
-            # qty_to_close = details['qty']
-            # side = 'sell' if details['type'] == 'long' else 'buy'
-            # order = order_manager.place_limit_order(ticker, qty_to_close, current_price, side)
-            # if order:
-            #    logger.log_action(f"Placed order to close {ticker} due to max holding period.")
-            #    remove_position(ticker, current_price, "max_hold_period") # Assuming order fills instantly for now
-            # else:
-            #    logger.log_action(f"Failed to place closing order for {ticker} (max hold). Will retry.")
-            remove_position(ticker, current_price, "max_hold_period_mock_close") # Mock closing
-            continue # Move to next position
+            logger.log_action(f"Position Manager: Position {ticker} (type: {position_type}) hit max holding period of {config.MAX_HOLDING_PERIOD_DAYS} days.")
+            exit_reason = f"max_hold_{config.MAX_HOLDING_PERIOD_DAYS}_days"
+            # Don't continue here; proceed to place order below, then skip z-score check if order placed
 
-        # 2. Check Stop-Loss and Exit Signals using current z-score
-        # This requires historical data up to 'today' to calculate the most recent z-score
-        ticker_historical_data = all_historical_data.get(ticker)
-        if ticker_historical_data is None:
-            logger.log_action(f"No historical data for {ticker} to re-evaluate z-score. Skipping stop/exit check.")
-            continue
+        # 2. Check Z-Score Based Exit/Stop-Loss (only if not already exiting due to max hold)
+        if not exit_reason:
+            ticker_hist_data_for_z = all_historical_data.get(ticker)
+            if ticker_hist_data_for_z is None or ticker_hist_data_for_z.empty:
+                logger.log_action(f"Position Manager: No historical data for {ticker} to re-evaluate z-score. Skipping z-score based exit/stop check.")
+            else:
+                # Prepare data for current z-score calculation:
+                # Append current price to historical data.
+                # Ensure DataFrame has a datetime index and 'close' column.
+                # The historical data should already be like this.
+                # Create a new row for the current price.
+                # We need to be careful with the index for the new row.
+                # Assuming historical data is daily, and index is Date.
+                # For simplicity, if historical data has 'close', use it.
 
-        # Append current price to historical data for up-to-date z-score
-        # This is a simplification; ideally, the data fetcher provides data up to the point of decision.
-        # For now, we assume historical_data includes the bar that resulted in current_price.
-        # z_scores = signal_generator.calculate_zscore(ticker_historical_data)
-        # if z_scores is None or z_scores.empty:
-        #     logger.log_action(f"Could not calculate z-score for {ticker}. Skipping stop/exit check.")
-        #     continue
-        # current_z_score = z_scores.iloc[-1]
+                # Create a copy to avoid modifying the original dict entry
+                temp_hist_data = ticker_hist_data_for_z.copy()
 
-        # Let's assume signal_generator can take current price and derive z-score or we pass z-score directly
-        # For simplicity, let's call generate_signals which internally might calculate z-score
-        # This part needs careful handling of data for z-score calculation relative to current price.
-        # The `signal_generator.generate_signals` expects historical_data_df for z-score calc.
-        # We need to ensure this df is appropriate (e.g., ends just before current_price or includes it).
+                # Ensure 'close' column exists
+                if 'close' not in temp_hist_data.columns:
+                    logger.log_action(f"Position Manager: 'close' column missing in historical data for {ticker}. Cannot calculate z-score for exit.")
+                else:
+                    # Append current price. For daily data, use today's date as index.
+                    # This might need adjustment if historical data has time component.
+                    # Using pd.Timestamp.now() for a generic approach, assuming 'close' is the target column.
+                    # If index is not datetime, this might cause issues.
+                    # A robust way is to ensure historical_data has a proper timeseries index.
+                    try:
+                        # Create a new DataFrame for the current price with a matching index type
+                        # Assuming the index of temp_hist_data is a DatetimeIndex
+                        if isinstance(temp_hist_data.index, pd.DatetimeIndex):
+                            current_price_row = pd.DataFrame({'close': [current_price]}, index=[pd.Timestamp.now(tz=temp_hist_data.index.tz)])
+                            # Ensure columns match for concatenation
+                            for col in temp_hist_data.columns:
+                                if col not in current_price_row.columns:
+                                     current_price_row[col] = pd.NA # Or np.nan
+                            temp_hist_data_with_current = pd.concat([temp_hist_data, current_price_row[['close']]]) # Only use 'close' for z-score relevant part
+                        else: # Fallback if index is not datetime (less ideal)
+                             # This branch might indicate an issue with how historical_data is structured/indexed
+                            logger.log_action(f"Position Manager: Historical data for {ticker} does not have a DatetimeIndex. Appending current price might be inexact.")
+                            # Attempt to append anyway, assuming 'close' is the primary data for z-score
+                            last_index = temp_hist_data.index[-1]
+                            # Create a compatible index for the new row
+                            new_index = last_index + pd.Timedelta(days=1) if isinstance(last_index, pd.Timestamp) else (temp_hist_data.index.max() + 1  if pd.api.types.is_numeric_dtype(temp_hist_data.index) else len(temp_hist_data))
 
-        # Simplified: Assume current_z_score is available or calculated by signal_generator
-        # from the provided historical_data_df (which should be up-to-date).
-        # current_signal = signal_generator.generate_signals(ticker, ticker_historical_data, current_z_score=None) # Recalculates z-score
+                            current_price_row = pd.DataFrame({'close': [current_price]}, index=[new_index])
+                            temp_hist_data_with_current = pd.concat([temp_hist_data, current_price_row])
 
-        # TODO: This logic needs to be more robust.
-        # We need a clear way to get the *current* z-score based on the *current* price.
-        # The `generate_signals` function might need adjustment or a dedicated function for this.
-        # For now, let's simulate this part.
-        # Placeholder for z-score based exit/stop-loss
-        # if details['type'] == 'long':
-        #     if current_z_score > config.Z_EXIT_LONG and current_z_score < 0: # Exit long
-        #         # place order, remove position
-        #     elif current_z_score < config.Z_STOP_LOSS_LONG: # Stop loss long
-        #         # place order, remove position
-        # elif details['type'] == 'short':
-        #     if current_z_score < config.Z_EXIT_SHORT and current_z_score > 0: # Exit short
-        #         # place order, remove position
-        #     elif current_z_score > config.Z_STOP_LOSS_SHORT: # Stop loss short
-        #         # place order, remove position
-        pass # End of loop
 
-    # save_positions(positions) # Save any P&L updates if we were tracking that live
+                        current_z_score_series = signal_generator.calculate_zscore(temp_hist_data_with_current['close'])
+                        if current_z_score_series is not None and not current_z_score_series.empty and not pd.isna(current_z_score_series.iloc[-1]):
+                            current_z_score = current_z_score_series.iloc[-1]
+                            logger.log_action(f"Position Manager: Current Z-score for {ticker} (pos type: {position_type}) is {current_z_score:.2f} for exit eval.")
+
+                            signal = signal_generator.generate_signals(ticker, None, current_z_score=current_z_score)
+
+                            if position_type == 'long':
+                                if signal == "EXIT_LONG":
+                                    exit_reason = "exit_long_signal"
+                                elif signal == "STOP_LOSS_LONG":
+                                    exit_reason = "stop_loss_long_signal"
+                            elif position_type == 'short':
+                                if signal == "EXIT_SHORT":
+                                    exit_reason = "exit_short_signal"
+                                elif signal == "STOP_LOSS_SHORT":
+                                    exit_reason = "stop_loss_short_signal"
+
+                            if exit_reason:
+                                logger.log_action(f"Position Manager: Signal '{signal}' triggered exit for {ticker} ({position_type}). Reason: {exit_reason}")
+                        else:
+                            logger.log_action(f"Position Manager: Could not calculate current z-score for {ticker} for exit evaluation.")
+                    except Exception as e:
+                        logger.log_action(f"Position Manager: Error during z-score calculation or signal generation for {ticker} exit: {e}")
+
+
+        # 3. Place Exit Order if a reason was determined
+        if exit_reason:
+            side_to_close = 'sell' if position_type == 'long' else 'buy'
+            logger.log_action(f"Position Manager: Attempting to place {side_to_close} order for {qty_to_close} {ticker} @ limit {current_price} due to: {exit_reason}")
+
+            exit_order = order_manager.place_limit_order(
+                ticker, qty_to_close, current_price, side_to_close, api_client=api_client
+            )
+
+            if exit_order and hasattr(exit_order, 'id'):
+                logger.log_action(f"Position Manager: Exit order {exit_order.id} placed for {ticker}. Status: {exit_order.status}")
+                # Update position details in the 'positions' dict (which is a copy being iterated)
+                positions[ticker]['status'] = 'pending_exit'
+                positions[ticker]['pending_exit_order_id'] = exit_order.id
+                positions[ticker]['pending_exit_order_placed_at'] = datetime.now().isoformat() # Or use order.created_at if available and preferred
+                positions[ticker]['exit_reason_for_order'] = exit_reason
+                exit_order_placed = True
+                positions_updated = True
+            else:
+                logger.log_action(f"Position Manager: Failed to place exit order for {ticker} for reason: {exit_reason}. Will retry next run.")
+
+        # If an exit order was placed (either max hold or z-score), this iteration for the ticker is done.
+        if exit_order_placed:
+            continue # Move to the next ticker in the loop
+
+    # Save all updated positions to file if any changes were made
+    if positions_updated:
+        logger.log_action("Position Manager: Saving updated positions after management cycle.")
+        save_positions(positions)
+    else:
+        logger.log_action("Position Manager: No positions were updated in this management cycle.")
+
 
 def get_pdt_trade_count(lookback_days=5):
     """

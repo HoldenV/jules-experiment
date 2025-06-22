@@ -19,8 +19,8 @@ import position_manager # For managing open positions and state
 import signal_generator # For generating trading signals
 
 # File to store IDs of entry orders placed in the current run.
-# These are assumed to be 'day' orders and this file helps track their fill status within the same session.
-PENDING_ENTRY_ORDERS_FILE = "pending_entry_orders_today.json" # Consistent with config.py or define in one place
+# This path will now be taken from config.py for consistency.
+# PENDING_ENTRY_ORDERS_FILE = "pending_entry_orders_today.json" # Old definition
 
 def initialize_api_client():
     """
@@ -52,33 +52,38 @@ def initialize_api_client():
 
 def load_pending_entry_orders():
     """
-    Loads pending entry orders from the JSON file.
+    Loads pending entry orders from the JSON file specified in config.
     Returns an empty dictionary if the file doesn't exist or an error occurs.
     """
-    if not os.path.exists(PENDING_ENTRY_ORDERS_FILE):
+    # Ensure the directory for the pending orders file exists (it's in CURRENT_RUN_DIR)
+    os.makedirs(os.path.dirname(config.PENDING_ENTRY_ORDERS_TODAY_FILE), exist_ok=True)
+
+    if not os.path.exists(config.PENDING_ENTRY_ORDERS_TODAY_FILE):
         return {}
     try:
-        with open(PENDING_ENTRY_ORDERS_FILE, 'r') as f:
+        with open(config.PENDING_ENTRY_ORDERS_TODAY_FILE, 'r') as f:
             content = f.read()
             if not content: # Handle empty file
                 return {}
             return json.loads(content)
     except json.JSONDecodeError as e:
-        logger.log_action(f"Error decoding JSON from {PENDING_ENTRY_ORDERS_FILE}: {e}. Returning empty dict.")
+        logger.log_action(f"Error decoding JSON from {config.PENDING_ENTRY_ORDERS_TODAY_FILE}: {e}. Returning empty dict.")
         return {}
     except Exception as e:
-        logger.log_action(f"Error loading pending entry orders from {PENDING_ENTRY_ORDERS_FILE}: {e}")
+        logger.log_action(f"Error loading pending entry orders from {config.PENDING_ENTRY_ORDERS_TODAY_FILE}: {e}")
         return {}
 
 def save_pending_entry_orders(orders):
     """
-    Saves the given dictionary of pending entry orders to the JSON file.
+    Saves the given dictionary of pending entry orders to the JSON file specified in config.
     """
+    # Ensure the directory for the pending orders file exists
+    os.makedirs(os.path.dirname(config.PENDING_ENTRY_ORDERS_TODAY_FILE), exist_ok=True)
     try:
-        with open(PENDING_ENTRY_ORDERS_FILE, 'w') as f:
+        with open(config.PENDING_ENTRY_ORDERS_TODAY_FILE, 'w') as f:
             json.dump(orders, f, indent=4)
     except Exception as e:
-        logger.log_action(f"Error saving pending entry orders to {PENDING_ENTRY_ORDERS_FILE}: {e}")
+        logger.log_action(f"Error saving pending entry orders to {config.PENDING_ENTRY_ORDERS_TODAY_FILE}: {e}")
 
 
 def main():
@@ -109,7 +114,8 @@ def main():
             order_id = details['pending_exit_order_id']
             logger.log_action(f"Checking status of pending exit order {order_id} for {ticker}.")
 
-            order_status_obj = order_manager.get_order_status(order_id)
+            # Pass the API client
+            order_status_obj = order_manager.get_order_status(order_id, api_client=api)
 
             if order_status_obj:
                 if order_status_obj.status == 'filled':
@@ -128,6 +134,7 @@ def main():
                     current_positions[ticker]['status'] = 'open'
                     current_positions[ticker]['pending_exit_order_id'] = None
                     current_positions[ticker]['pending_exit_order_placed_at'] = None
+                    current_positions[ticker]['exit_reason_for_order'] = None # Clear the reason as well
                 else: # e.g., 'new', 'accepted', 'partially_filled', 'pending_cancel'
                     logger.log_action(f"Exit order {order_id} for {ticker} is still '{order_status_obj.status}'. Will check again next run.")
             else:
@@ -141,13 +148,14 @@ def main():
     all_tickers = config.TICKERS
 
     # Fetch historical data for z-score calculation (window + buffer)
-    # data_fetcher initializes its own Alpaca API client based on .env settings.
+    # Pass the initialized API client to data_fetcher functions
     historical_data_multi_df = data_fetcher.get_historical_data(
         all_tickers,
         timeframe='1Day', # Assuming daily z-score calculation
-        limit_per_ticker=config.Z_SCORE_WINDOW + 20 # +20 as buffer for initial NaNs
+        limit_per_ticker=config.Z_SCORE_WINDOW + 20, # +20 as buffer for initial NaNs
+        api_client=api
     )
-    latest_prices = data_fetcher.get_latest_prices(all_tickers)
+    latest_prices = data_fetcher.get_latest_prices(all_tickers, api_client=api)
 
     # Basic check if critical data was fetched
     if historical_data_multi_df.empty and not latest_prices:
@@ -177,7 +185,8 @@ def main():
     # This function iterates through 'open' positions, checks exit conditions (max hold, z-score based exits/stops),
     # places closing orders if necessary, and updates their status to 'pending_exit'.
     logger.log_action("Step 3: Managing currently open positions for potential exits...")
-    position_manager.check_and_manage_open_positions(latest_prices, historical_data_map_for_pm)
+    # Pass the API client to check_and_manage_open_positions, it will need it for placing orders
+    position_manager.check_and_manage_open_positions(latest_prices, historical_data_map_for_pm, api_client=api)
 
     current_positions = position_manager.load_positions() # Reload as statuses might have changed to 'pending_exit'
 
@@ -262,7 +271,8 @@ def main():
             # Place the order
             order_side = 'buy' if signal == "BUY" else 'sell'
             logger.log_action(f"Attempting to place {order_side} order: {qty} shares of {ticker_symbol} @ limit ${current_price:.2f}")
-            entry_order = order_manager.place_limit_order(ticker_symbol, qty, current_price, order_side)
+            # Pass the API client
+            entry_order = order_manager.place_limit_order(ticker_symbol, qty, current_price, order_side, api_client=api)
 
             if entry_order and hasattr(entry_order, 'id'):
                 logger.log_action(f"Entry order {entry_order.id} ({order_side} {qty} {ticker_symbol}) placed. Status: {entry_order.status}")
@@ -289,7 +299,8 @@ def main():
 
     for order_id, order_details in list(pending_entry_orders_today.items()): # Use list() for safe modification
         logger.log_action(f"Checking status of new entry order {order_id} for {order_details['ticker']}.")
-        order_status_obj = order_manager.get_order_status(order_id)
+        # Pass the API client
+        order_status_obj = order_manager.get_order_status(order_id, api_client=api)
         if order_status_obj:
             if order_status_obj.status == 'filled':
                 try:
@@ -335,7 +346,8 @@ def main():
         logger.log_action("New positions were opened. Re-running position management for potential immediate exits...")
         # latest_prices and historical_data_map_for_pm are from earlier in this run.
         # For maximum accuracy, could re-fetch, but for an immediate check, existing data might be sufficient.
-        position_manager.check_and_manage_open_positions(latest_prices, historical_data_map_for_pm)
+        # Pass the API client
+        position_manager.check_and_manage_open_positions(latest_prices, historical_data_map_for_pm, api_client=api)
 
     logger.log_action(f"===== Trading Bot session finished at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} =====\n")
 
@@ -343,14 +355,17 @@ if __name__ == "__main__":
     # This script is designed to be run once per day as per the "Trade Schedule".
     # Actual scheduling (e.g., via cron or Windows Task Scheduler) is external.
 
-    # Clear the pending entry orders file from any previous (e.g., test) runs.
+    # Clear the pending entry orders file from any previous (e.g., test) runs,
+    # using the path from config.py.
     # In a robust production environment, one might inspect this file for orders
     # from a crashed previous session instead of blindly deleting.
-    if os.path.exists(PENDING_ENTRY_ORDERS_FILE):
-        logger.log_action(f"Clearing previous pending entry orders file: {PENDING_ENTRY_ORDERS_FILE}")
+    # Ensure the directory for the pending orders file exists before attempting to remove the file.
+    os.makedirs(os.path.dirname(config.PENDING_ENTRY_ORDERS_TODAY_FILE), exist_ok=True)
+    if os.path.exists(config.PENDING_ENTRY_ORDERS_TODAY_FILE):
+        logger.log_action(f"Clearing previous pending entry orders file: {config.PENDING_ENTRY_ORDERS_TODAY_FILE}")
         try:
-            os.remove(PENDING_ENTRY_ORDERS_FILE)
+            os.remove(config.PENDING_ENTRY_ORDERS_TODAY_FILE)
         except OSError as e:
-            logger.log_action(f"Error removing {PENDING_ENTRY_ORDERS_FILE}: {e}")
+            logger.log_action(f"Error removing {config.PENDING_ENTRY_ORDERS_TODAY_FILE}: {e}")
 
     main()
