@@ -34,7 +34,7 @@ def calculate_zscore(prices_df):
 
     # Avoid division by zero if std is 0 (e.g., prices are constant)
     z_scores = (prices - moving_avg) / rolling_std.replace(0, np.nan)
-    return z_scores.fillna(method='ffill') # Forward fill NaNs that might occur at the start or due to std=0
+    return z_scores.ffill() # Forward fill NaNs that might occur at the start or due to std=0
 
 def generate_signals(ticker, historical_data_df, current_z_score=None):
     """

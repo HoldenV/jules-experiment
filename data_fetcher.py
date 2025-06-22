@@ -4,6 +4,7 @@ import config
 import os
 import logger  # Import logger for logging actions
 from dotenv import load_dotenv
+from datetime import datetime, timedelta
 
 # Load environment variables from .env file
 load_dotenv()
@@ -58,25 +59,33 @@ def get_historical_data(tickers, timeframe='1Day', limit_per_ticker=200, api_cli
         return pd.DataFrame()
 
     try:
-        logger.log_action(f"Data Fetcher: Fetching historical data for {len(tickers)} tickers: {', '.join(tickers)}. Timeframe: {timeframe}, Limit: {limit_per_ticker}")
+        # Calculate the end date as the end of the previous trading day
+        end_date = datetime.now().date() - timedelta(days=1)
+        # Calculate the start date based on the limit
+        start_date = end_date - timedelta(days=limit_per_ticker + 5) # Add a buffer just in case
+
+        logger.log_action(f"Data Fetcher: Fetching historical data for {len(tickers)} tickers: {', '.join(tickers)}. Timeframe: {timeframe}, Start Date: {start_date.isoformat()}, End Date: {end_date.isoformat()}")
         # The get_bars method can take a list of symbols.
         # The .df attribute will structure it into a multi-index DataFrame.
-        bars_df = current_api_client.get_bars(tickers, timeframe, limit=limit_per_ticker).df
+        # Pass start and end dates formatted as YYYY-MM-DD strings
+        bars_df = current_api_client.get_bars(tickers, timeframe, start=start_date.isoformat(), end=end_date.isoformat()).df
 
         if bars_df.empty:
             logger.log_action(f"Data Fetcher: No historical data returned for tickers: {', '.join(tickers)}")
             return pd.DataFrame()
 
-        # Ensure the DataFrame has the 'symbol' column if it's not in the index already
-        # For get_bars().df, 'symbol' is usually the first level of the MultiIndex.
-        # If it's a single ticker, it might not have 'symbol' index level.
-        if 'symbol' not in bars_df.index.names:
-            if len(tickers) == 1 and not bars_df.empty:
-                # If single ticker and df not empty, add symbol index level
-                bars_df['symbol'] = tickers[0]
-                bars_df = bars_df.set_index('symbol', append=True).reorder_levels(['symbol', 'timestamp'])
-            else:
-                logger.log_action("Warning: 'symbol' not in index and multiple tickers requested. DataFrame might be malformed.")
+        if bars_df.empty:
+             logger.log_action(f"Data Fetcher: No historical data returned for tickers: {', '.join(tickers)}")
+             return pd.DataFrame() # Return empty DataFrame if still empty
+
+        # Reset index to turn index levels into columns, then set a new MultiIndex
+        bars_df = bars_df.reset_index()
+        if 'symbol' in bars_df.columns and 'timestamp' in bars_df.columns:
+            bars_df = bars_df.set_index(['symbol', 'timestamp'])
+        else:
+            logger.log_action("Error: Could not find 'symbol' or 'timestamp' columns after resetting index. DataFrame might be malformed.")
+            return pd.DataFrame()
+
 
         logger.log_action(f"Data Fetcher: Successfully fetched historical data for {len(bars_df.index.get_level_values('symbol').unique())} tickers.")
         return bars_df
