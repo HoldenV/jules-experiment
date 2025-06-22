@@ -8,7 +8,6 @@ def log_action(message):
     Logs an action message to the bot's log file with a timestamp.
     :param message: The message string to log.
     """
-    # Ensure the log directory exists before writing
     os.makedirs(os.path.dirname(config.LOG_FILE), exist_ok=True)
 
     timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
@@ -16,10 +15,9 @@ def log_action(message):
     try:
         with open(config.LOG_FILE, 'a') as f:
             f.write(log_entry)
-        # Optional: print to console as well
-        # print(log_entry.strip())
     except Exception as e:
-        print(f"Error writing to log file {config.LOG_FILE}: {e}")
+        # Fallback to print if logging to file fails
+        print(f"CRITICAL: Error writing to log file {config.LOG_FILE}: {e}. Log message: {log_entry.strip()}")
 
 def record_trade(ticker, entry_date, exit_date, entry_price, exit_price, profit_loss, reason_for_exit):
     """
@@ -30,15 +28,13 @@ def record_trade(ticker, entry_date, exit_date, entry_price, exit_price, profit_
     :param entry_price: Entry price.
     :param exit_price: Exit price.
     :param profit_loss: Profit or loss from the trade.
-    :param reason_for_exit: Reason for closing the trade (e.g., "signal", "stop-loss", "max_duration").
+    :param reason_for_exit: Reason for closing the trade.
     """
-    # Ensure the trades CSV directory exists before writing
     os.makedirs(os.path.dirname(config.TRADES_CSV_FILE), exist_ok=True)
 
     file_exists = os.path.isfile(config.TRADES_CSV_FILE)
     fieldnames = ['Ticker', 'EntryDate', 'ExitDate', 'EntryPrice', 'ExitPrice', 'ProfitLoss', 'ExitReason']
 
-    # Convert datetime objects to string if they are not already
     entry_date_str = entry_date.strftime('%Y-%m-%d %H:%M:%S') if isinstance(entry_date, datetime) else str(entry_date)
     exit_date_str = exit_date.strftime('%Y-%m-%d %H:%M:%S') if isinstance(exit_date, datetime) else str(exit_date)
 
@@ -56,17 +52,18 @@ def record_trade(ticker, entry_date, exit_date, entry_price, exit_price, profit_
         with open(config.TRADES_CSV_FILE, 'a', newline='') as csvfile:
             writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
             if not file_exists or os.path.getsize(config.TRADES_CSV_FILE) == 0:
-                writer.writeheader() # Write header only if file is new/empty
+                writer.writeheader()
             writer.writerow(row)
         log_action(f"Recorded trade for {ticker}: P&L {profit_loss:.2f}, Exit Reason: {reason_for_exit}")
     except Exception as e:
-        log_action(f"Error writing to trades CSV file {config.TRADES_CSV_FILE}: {e}")
-        print(f"Error writing to trades CSV file {config.TRADES_CSV_FILE}: {e}")
+        # Fallback to print if logging to file fails
+        error_message = f"CRITICAL: Error writing to trades CSV {config.TRADES_CSV_FILE}: {e}. Trade data: {row}"
+        log_action(error_message) # Attempt to log the error itself
+        print(error_message)
 
 
 if __name__ == '__main__':
     # Example Usage and Test
-    # Clean up old test files if they exist
     if os.path.exists(config.LOG_FILE):
         os.remove(config.LOG_FILE)
     if os.path.exists(config.TRADES_CSV_FILE):
@@ -81,24 +78,23 @@ if __name__ == '__main__':
         exit_date=datetime(2023, 1, 12, 15, 0, 0),
         entry_price=150.25,
         exit_price=155.75,
-        profit_loss=550.00, # (155.75 - 150.25) * 100 shares (example)
+        profit_loss=550.00,
         reason_for_exit="signal"
     )
 
     record_trade(
         ticker="MSFT",
-        entry_date="2023-02-01 10:00:00", # String date
-        exit_date="2023-02-05 14:30:00",   # String date
+        entry_date="2023-02-01 10:00:00",
+        exit_date="2023-02-05 14:30:00",
         entry_price=280.50,
         exit_price=275.00,
-        profit_loss=-275.00, # (275.00 - 280.50) * 50 shares (example)
+        profit_loss=-275.00,
         reason_for_exit="stop-loss"
     )
     log_action("Bot session ended.")
 
-    print(f"Log file '{config.LOG_FILE}' and CSV file '{config.TRADES_CSV_FILE}' should be created with example entries.")
+    print(f"Log file '{config.LOG_FILE}' and CSV file '{config.TRADES_CSV_FILE}' created with example entries.")
 
-    # Verify content of log file
     print(f"\n--- Contents of {config.LOG_FILE} ---")
     if os.path.exists(config.LOG_FILE):
         with open(config.LOG_FILE, 'r') as f:
@@ -106,7 +102,6 @@ if __name__ == '__main__':
     else:
         print("Log file not found.")
 
-    # Verify content of CSV file
     print(f"\n--- Contents of {config.TRADES_CSV_FILE} ---")
     if os.path.exists(config.TRADES_CSV_FILE):
         with open(config.TRADES_CSV_FILE, 'r') as f:

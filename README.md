@@ -142,3 +142,21 @@ Adjust the time (e.g., `16:00` for 12:00 PM ET if your server is in UTC and ET i
 - A dedicated backtesting framework to thoroughly test strategy parameters and variations.
 - More comprehensive error handling, including retry mechanisms for transient API issues.
 - A simple web dashboard or regular email reports for monitoring bot status, open positions, and performance.
+- **Review `data_fetcher.py` - `get_historical_data`:**
+    - Clarify and potentially adjust date calculations for `start_date` and `end_date` to ensure correctness regardless of when the bot is run (e.g., intraday vs. post-market).
+    - Evaluate if the `+5` day buffer for `start_date` is always sufficient for `limit_per_ticker` actual trading days, or if using Alpaca's `limit` parameter directly is more reliable.
+    - Remove duplicate empty DataFrame check.
+- **Review `position_manager.py` - `check_and_manage_open_positions`:**
+    - Refine the method for appending `current_price` to historical data for z-score calculation to ensure robustness, especially if data frequencies or timings change.
+    - Improve fallback logic for `new_index` creation when historical data doesn't have a `DatetimeIndex`.
+- **Implement robust PDT tracking in `position_manager.py` - `get_pdt_trade_count`:**
+    - The current implementation is a placeholder. Full PDT tracking requires careful handling of trade times and definitions.
+- **Clarify `pending_orders.json` management in `trading_bot.py`:**
+    - Define the intended lifecycle of `pending_orders.json`. If it's for persistent tracking across runs, the current deletion logic after snapshotting to `RUN_PENDING_ORDERS_FILE` needs review.
+    - Ensure the state synchronization with Alpaca at the start of each run is the primary source of truth for open orders.
+- **Review Z-Score signal generation in `signal_generator.py`:**
+    - Double-check the logic for `EXIT_LONG` and `EXIT_SHORT` conditions (e.g., `Z_EXIT_LONG > current_z_score > Z_ENTRY_LONG`) to ensure they behave as expected under all z-score configurations.
+- **State Management Strategy:**
+    - Solidify the strategy for how `positions.json` and `pending_orders.json` interact and how their state is reconciled with Alpaca, especially concerning persistence versus derivation from the broker.
+- **Code Comments:**
+    - Perform a pass to remove overly verbose or obvious comments and ensure remaining comments explain "why" rather than "what," or clarify complex logic.
