@@ -116,12 +116,19 @@ def main():
 
     # Step 1: Manage Existing Positions and Orders
     logger.log_action("Step 1: Managing existing positions & checking pending orders...")
+    
+    # Fetch open orders from Alpaca
     alpaca_open_orders_list = order_manager.get_open_orders(api_client=api, tickers=config.TICKERS)
     alpaca_open_orders_map = {} # Ticker -> [AlpacaOrder]
     for order in alpaca_open_orders_list:
         alpaca_open_orders_map.setdefault(order.symbol, []).append(order)
         logger.log_action(f"Found open Alpaca order: ID {order.id}, {order.symbol}, {order.side}, Qty {order.qty}, Price {order.limit_price or 'N/A'}, Status {order.status}")
     if not alpaca_open_orders_list: logger.log_action("No open orders on Alpaca for configured tickers.")
+
+    # Fetch open positions from Alpaca
+    alpaca_open_positions_map = data_fetcher.get_alpaca_open_positions(api_client=api)
+    for ticker, pos in alpaca_open_positions_map.items():
+        logger.log_action(f"Found open Alpaca position: {pos.symbol}, Qty {pos.qty}, Avg Entry {pos.avg_entry_price}")
 
     # Reconcile positions.json with Alpaca's open exit orders
     current_positions = position_manager.load_positions()
@@ -196,7 +203,7 @@ def main():
     # Step 3: Manage Open Positions (Check for Exits)
     logger.log_action("Step 3: Managing open positions for potential exits...")
     position_manager.check_and_manage_open_positions(
-        latest_prices, historical_data_map_for_pm, api, alpaca_open_orders_map
+        latest_prices, historical_data_map_for_pm, api, alpaca_open_orders_map, alpaca_open_positions_map
     )
     current_positions = position_manager.load_positions() # Reload after potential status changes
 

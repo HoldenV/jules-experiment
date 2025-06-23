@@ -109,24 +109,71 @@ def remove_position(ticker, exit_price, exit_reason, exit_order_id=None):
     else:
         logger.log_action(f"Position Manager: Attempted to remove non-existent position for {ticker}.")
 
-def check_and_manage_open_positions(current_prices, all_historical_data, api_client, alpaca_open_orders_map=None):
+def check_and_manage_open_positions(current_prices, all_historical_data, api_client, alpaca_open_orders_map=None, alpaca_open_positions_map=None):
     """
-    Manages open positions: checks max hold, stop-loss, exit signals.
+    Manages open positions: checks max hold, stop-loss, exit signals, and reconciles with Alpaca.
     :param all_historical_data: Dict {ticker: pd.DataFrame} for signal re-evaluation.
     :param alpaca_open_orders_map: Optional Dict {ticker: [AlpacaOrder]} from Alpaca.
+    :param alpaca_open_positions_map: Optional Dict {ticker: AlpacaPosition} from Alpaca.
     """
     positions = load_positions()
+    alpaca_open_orders_map = alpaca_open_orders_map if alpaca_open_orders_map is not None else {}
+    alpaca_open_positions_map = alpaca_open_positions_map if alpaca_open_positions_map is not None else {}
+
+    logger.log_action("Position Manager: Starting position management and reconciliation...")
+    positions_updated = False
+    today = datetime.now()
+
+    # --- Phase 1: Reconcile local positions with Alpaca's actual open positions ---
+    # Add positions present in Alpaca but not locally
+    for ticker, alpaca_pos in alpaca_open_positions_map.items():
+        if ticker not in positions:
+            logger.log_action(f"Position Manager: Found new open position on Alpaca for {ticker}. Adding to local records.")
+            # Attempt to get entry price from Alpaca position or use current price as fallback
+            entry_price = float(alpaca_pos.avg_entry_price) if hasattr(alpaca_pos, 'avg_entry_price') else current_prices.get(ticker, 0.0)
+            if entry_price == 0.0:
+                logger.log_action(f"Position Manager: Warning - Could not determine entry price for {ticker} from Alpaca. Using current price as fallback.")
+
+            # Determine position type ('long' or 'short')
+            position_type = 'long' if float(alpaca_pos.qty) > 0 else 'short'
+            
+            # Use Alpaca's quantity, ensuring it's positive for our internal record
+            qty = abs(float(alpaca_pos.qty))
+
+            # Alpaca position objects don't directly have an 'entry_date' or 'entry_order_id' in the same way
+            # For reconciliation, we'll use the current time as a proxy for entry_date if not available,
+            # and a placeholder for entry_order_id.
+            # In a real-world scenario, you might fetch historical orders to find the actual entry order.
+            add_position(ticker, qty, entry_price, position_type, entry_order_id="ALPACA_RECONCILE", entry_date=datetime.now())
+            positions_updated = True
+            # Reload positions after adding to ensure the latest state is used for subsequent checks
+            positions = load_positions()
+
+    # Remove positions present locally but not in Alpaca (meaning they were closed externally)
+    tickers_to_remove = []
+    for ticker, details in positions.items():
+        if ticker not in alpaca_open_positions_map and details.get('status') == 'open':
+            logger.log_action(f"Position Manager: Local position for {ticker} is 'open' but not found on Alpaca. Assuming external closure.")
+            # We don't have the exit price or reason from external closure, so we'll log a generic closure.
+            # In a more advanced system, you might try to fetch recent closed orders from Alpaca.
+            current_price = current_prices.get(ticker, details['entry_price']) # Fallback to entry price
+            remove_position(ticker, current_price, "external_closure_reconciliation")
+            tickers_to_remove.append(ticker) # Mark for removal from current iteration
+            positions_updated = True
+    
+    # Remove marked positions from the dictionary after iteration
+    for ticker in tickers_to_remove:
+        if ticker in positions:
+            del positions[ticker]
+
     if not positions:
-        logger.log_action("Position Manager: No open positions to manage.")
+        logger.log_action("Position Manager: No open positions to manage after reconciliation.")
         return
 
-    alpaca_open_orders_map = alpaca_open_orders_map if alpaca_open_orders_map is not None else {}
-    logger.log_action("Position Manager: Checking and managing open positions...")
-    today = datetime.now()
-    positions_updated = False
-
+    logger.log_action("Position Manager: Checking and managing open positions based on strategy...")
+    
+    # --- Phase 2: Apply strategy-based management to remaining 'open' local positions ---
     for ticker, details in list(positions.items()): # Iterate copy for safe modification
-        # Only manage 'open' positions here. 'pending_exit' is handled by trading_bot.py reconciliation.
         if details.get('status') != 'open':
             logger.log_action(f"Position Manager: Skipping {ticker}, status '{details.get('status', 'unknown')}' (not 'open').")
             continue

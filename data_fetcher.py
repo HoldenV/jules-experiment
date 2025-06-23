@@ -86,6 +86,26 @@ def get_historical_data(tickers, timeframe='1Day', limit_per_ticker=200, api_cli
         return pd.DataFrame()
 
 
+def get_alpaca_open_positions(api_client=None):
+    """
+    Fetches all currently open positions from Alpaca.
+    :param api_client: Optional initialized Alpaca API client.
+    :return: Dictionary {ticker: AlpacaPositionObject} or empty {} if error.
+    """
+    current_api_client = api_client if api_client else _initialize_api_client()
+    if not current_api_client:
+        logger.log_action("Data Fetcher (get_alpaca_open_positions): Alpaca API client not available.")
+        return {}
+
+    try:
+        alpaca_positions = current_api_client.list_positions()
+        positions_map = {pos.symbol: pos for pos in alpaca_positions}
+        logger.log_action(f"Data Fetcher: Successfully fetched {len(positions_map)} open positions from Alpaca.")
+        return positions_map
+    except Exception as e:
+        logger.log_action(f"Data Fetcher: Error fetching open positions from Alpaca: {e}")
+        return {}
+
 def get_latest_prices(tickers, api_client=None):
     """
     Fetches the latest trade price for a list of tickers.
