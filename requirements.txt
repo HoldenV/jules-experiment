@@ -2,3 +2,4 @@ alpaca-trade-api
 pandas
 python-dotenv
 numpy
+pandas_market_calendars
