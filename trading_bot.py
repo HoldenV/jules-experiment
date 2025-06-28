@@ -89,92 +89,139 @@ def main():
         return
 
     # Initial synchronization of pending_orders.json with Alpaca
-    # TODO: Review lifecycle of PENDING_ORDERS_FILE (see README TODOs)
-    logger.log_action("Synchronizing pending_orders.json with live Alpaca open orders...")
-    local_pending_orders = load_pending_orders()
+    # --- Bot State Initialization ---
+    # 1. Synchronize Pending Orders with Alpaca
+    logger.log_action("Initializing Bot State: Synchronizing pending orders with Alpaca...")
+    local_pending_orders_from_file = load_pending_orders() # Load what bot thought was pending
     alpaca_live_open_orders = order_manager.get_open_orders(api_client=api)
-    synchronized_pending_orders = {}
-
-    for alpaca_order in alpaca_live_open_orders:
-        order_id = alpaca_order.id
-        if order_id in local_pending_orders:
-            order_details = local_pending_orders[order_id]
-            order_details['status'] = alpaca_order.status
-            synchronized_pending_orders[order_id] = order_details
-        else: # New order on Alpaca not tracked locally
-            placed_at_iso = alpaca_order.submitted_at.isoformat() if alpaca_order.submitted_at else datetime.now().isoformat()
-            inferred_type = f"alpaca_external_{alpaca_order.side}"
-            synchronized_pending_orders[order_id] = {
-                "ticker": alpaca_order.symbol, "qty": float(alpaca_order.qty),
-                "side": alpaca_order.side, "limit_price": float(alpaca_order.limit_price) if alpaca_order.limit_price else None,
-                "type": inferred_type, "placed_at": placed_at_iso,
-                "z_at_placement": None, "status": alpaca_order.status
-            }
-        logger.log_action(f"Synchronized: Order {order_id} ({alpaca_order.symbol}) status: {alpaca_order.status}")
-    save_pending_orders(synchronized_pending_orders)
-    logger.log_action(f"Synchronization complete. {len(synchronized_pending_orders)} pending orders in {config.PENDING_ORDERS_FILE}.")
-
-    # Step 1: Manage Existing Positions and Orders
-    logger.log_action("Step 1: Managing existing positions & checking pending orders...")
     
-    # Fetch open orders from Alpaca
-    alpaca_open_orders_list = order_manager.get_open_orders(api_client=api, tickers=config.TICKERS)
-    alpaca_open_orders_map = {} # Ticker -> [AlpacaOrder]
-    for order in alpaca_open_orders_list:
-        alpaca_open_orders_map.setdefault(order.symbol, []).append(order)
-        logger.log_action(f"Found open Alpaca order: ID {order.id}, {order.symbol}, {order.side}, Qty {order.qty}, Price {order.limit_price or 'N/A'}, Status {order.status}")
-    if not alpaca_open_orders_list: logger.log_action("No open orders on Alpaca for configured tickers.")
+    # Create a map of Alpaca live orders by ID for efficient lookup
+    alpaca_live_open_orders_map_by_id = {order.id: order for order in alpaca_live_open_orders}
 
-    # Fetch open positions from Alpaca
-    alpaca_open_positions_map = data_fetcher.get_alpaca_open_positions(api_client=api)
-    for ticker, pos in alpaca_open_positions_map.items():
-        logger.log_action(f"Found open Alpaca position: {pos.symbol}, Qty {pos.qty}, Avg Entry {pos.avg_entry_price}")
+    current_pending_orders = {} # This will be the source of truth for pending orders this run
 
-    # Reconcile positions.json with Alpaca's open exit orders
-    current_positions = position_manager.load_positions()
-    for ticker, details in list(current_positions.items()):
+    # Sync based on Alpaca's view
+    for order_id, alpaca_order in alpaca_live_open_orders_map_by_id.items():
+        ticker = alpaca_order.symbol
+        qty = float(alpaca_order.qty)
+        side = alpaca_order.side
+        limit_price = float(alpaca_order.limit_price) if alpaca_order.limit_price else None
+        status = alpaca_order.status
+
+        # Try to get supplementary data from local file
+        local_details = local_pending_orders_from_file.get(order_id, {})
+        order_type = local_details.get('type', f"alpaca_sync_{side}") # Infer type if not known
+        placed_at_str = local_details.get('placed_at')
+        z_at_placement = local_details.get('z_at_placement')
+
+        # Ensure placed_at is valid ISO format or use Alpaca's submission time
+        final_placed_at = datetime.now().isoformat() # Fallback
+        if hasattr(alpaca_order, 'submitted_at') and alpaca_order.submitted_at:
+            try:
+                # alpaca_order.submitted_at could be datetime or str depending on SDK version/settings
+                if isinstance(alpaca_order.submitted_at, datetime):
+                    final_placed_at = alpaca_order.submitted_at.isoformat()
+                else: # Assume string
+                    final_placed_at = pd.to_datetime(alpaca_order.submitted_at).isoformat()
+            except Exception as e_ts:
+                logger.log_action(f"Trading Bot (pending_order_sync): Error parsing submitted_at for order {order_id}: {e_ts}. Using fallback.")
+        elif placed_at_str: # Use local if Alpaca's is missing and local is present
+             final_placed_at = placed_at_str
+
+
+        current_pending_orders[order_id] = {
+            "ticker": ticker, "qty": qty, "side": side, "limit_price": limit_price,
+            "type": order_type, "placed_at": final_placed_at,
+            "z_at_placement": z_at_placement, "status": status
+        }
+        logger.log_action(f"Trading Bot (pending_order_sync): Synced/Verified pending order {order_id} ({ticker}) from Alpaca. Status: {status}")
+
+    # Log orders that were in local file but not in Alpaca's open orders (they might have filled/cancelled)
+    for order_id, local_details in local_pending_orders_from_file.items():
+        if order_id not in current_pending_orders:
+            logger.log_action(f"Trading Bot (pending_order_sync): Local pending order {order_id} ({local_details.get('ticker')}) not found in Alpaca open orders. Will be re-checked in Step 5.")
+            # These will be handled in the main reconciliation loop (Step 5) to confirm final status
+
+    save_pending_orders(current_pending_orders) # Save the Alpaca-centric view
+    logger.log_action(f"Trading Bot (pending_order_sync): Synchronization complete. {len(current_pending_orders)} pending orders tracked.")
+
+    # 2. Synchronize Positions with Alpaca
+    logger.log_action("Initializing Bot State: Synchronizing positions with Alpaca...")
+    alpaca_live_positions_map = data_fetcher.get_alpaca_open_positions(api_client=api)
+    local_positions_from_file = position_manager.load_positions_from_file() # Load raw local data
+
+    current_positions = position_manager.sync_positions_from_alpaca(alpaca_live_positions_map, local_positions_from_file)
+    position_manager.save_positions(current_positions) # Save the authoritative, synced state
+    logger.log_action(f"Trading Bot (position_sync): Synchronization complete. {len(current_positions)} open positions tracked.")
+    # `current_positions` is now the source of truth for positions for this run.
+    # It contains datetime objects where appropriate.
+
+    # --- Step 1: Pre-computation & Data Fetching ---
+    # (Renamed from "Manage Existing Positions and Orders" to better reflect its new role)
+    logger.log_action("Step 1: Fetching supporting data (orders, market data)...")
+
+    # Fetch all open orders from Alpaca again (or use `alpaca_live_open_orders` if fresh enough)
+    # This is used by position_manager.check_and_manage_open_positions to see if exit orders already exist.
+    alpaca_open_orders_list_for_pm = order_manager.get_open_orders(api_client=api, tickers=config.TICKERS)
+    alpaca_open_orders_map_for_pm = {} # Ticker -> [AlpacaOrder]
+    for order in alpaca_open_orders_list_for_pm:
+        alpaca_open_orders_map_for_pm.setdefault(order.symbol, []).append(order)
+    if not alpaca_open_orders_list_for_pm: logger.log_action("No open orders on Alpaca for configured tickers (for PM check).")
+    else: logger.log_action(f"Found {len(alpaca_open_orders_list_for_pm)} open Alpaca orders for PM check.")
+
+
+    # Initial check for filled/cancelled known exit orders in `current_positions`
+    # This updates status from 'pending_exit' to 'open' or removes the position.
+    positions_after_exit_check = current_positions.copy() # Work on a copy
+    any_positions_changed_by_exit_check = False
+    for ticker, details in list(positions_after_exit_check.items()): # Use list for safe removal
         if details.get('status') == 'pending_exit':
             known_exit_order_id = details.get('pending_exit_order_id')
             if known_exit_order_id:
-                logger.log_action(f"Checking known pending exit order {known_exit_order_id} for {ticker}.")
+                logger.log_action(f"Trading Bot (initial_exit_check): Checking known pending exit order {known_exit_order_id} for {ticker}.")
                 order_status_obj = order_manager.get_order_status(known_exit_order_id, api_client=api)
                 if order_status_obj:
                     if order_status_obj.status == 'filled':
                         try:
                             fill_price = float(order_status_obj.filled_avg_price)
-                            fill_qty = float(order_status_obj.filled_qty)
-                            logger.log_action(f"Known exit order {known_exit_order_id} for {ticker} FILLED. Qty: {fill_qty}, Price: ${fill_price}.")
-                            exit_reason = details.get('exit_reason_for_order', 'automated_exit_filled')
-                            position_manager.remove_position(ticker, fill_price, exit_reason, known_exit_order_id)
-                            if ticker in alpaca_open_orders_map: # Remove from map if it was there
-                                alpaca_open_orders_map[ticker] = [o for o in alpaca_open_orders_map[ticker] if o.id != known_exit_order_id]
-                                if not alpaca_open_orders_map[ticker]: del alpaca_open_orders_map[ticker]
-                        except (ValueError, TypeError) as conv_err: # Catch specific conversion errors
-                            logger.log_action(f"Error converting fill data for known order {known_exit_order_id} ({ticker}): {conv_err}.")
-                        except Exception as ex: # Catch any other unexpected error
-                            logger.log_action(f"Unexpected error processing filled known order {known_exit_order_id} ({ticker}): {ex}")
+                            # fill_qty = float(order_status_obj.filled_qty) # Qty from position details is authority
+                            logger.log_action(f"Trading Bot (initial_exit_check): Known exit order {known_exit_order_id} for {ticker} FILLED. Price: ${fill_price}.")
+                            exit_reason = details.get('exit_reason_for_order', 'automated_exit_filled_at_startup')
+                            # Use remove_position which now takes positions dict
+                            positions_after_exit_check = position_manager.remove_position(positions_after_exit_check, ticker, fill_price, exit_reason, known_exit_order_id)
+                            any_positions_changed_by_exit_check = True
+                            # Also remove from current_pending_orders if it was there (shouldn't be if exit order)
+                            if known_exit_order_id in current_pending_orders:
+                                del current_pending_orders[known_exit_order_id]
+                        except Exception as ex:
+                            logger.log_action(f"Trading Bot (initial_exit_check): Error processing filled known exit order {known_exit_order_id} ({ticker}): {ex}")
                     elif order_status_obj.status in ['canceled', 'expired', 'rejected', 'done_for_day']:
-                        logger.log_action(f"Known exit order {known_exit_order_id} for {ticker} is {order_status_obj.status}. Reverting position to 'open'.")
-                        current_positions[ticker].update({'status': 'open', 'pending_exit_order_id': None, 'pending_exit_order_placed_at': None, 'exit_reason_for_order': None})
-                    else:
-                        logger.log_action(f"Known exit order {known_exit_order_id} for {ticker} is still '{order_status_obj.status}'.")
+                        logger.log_action(f"Trading Bot (initial_exit_check): Known exit order {known_exit_order_id} for {ticker} is {order_status_obj.status}. Reverting position to 'open'.")
+                        positions_after_exit_check[ticker].update({'status': 'open', 'pending_exit_order_id': None, 'pending_exit_order_placed_at': None, 'exit_reason_for_order': None})
+                        any_positions_changed_by_exit_check = True
+                        if known_exit_order_id in current_pending_orders: # Should also be removed from pending
+                             del current_pending_orders[known_exit_order_id]
+                    # else: status is still open-like, leave as 'pending_exit'
                 else: # Could not get status
-                    logger.log_action(f"Could not get status for known pending exit {known_exit_order_id} ({ticker}). Assuming inactive, reverting to 'open'.")
-                    current_positions[ticker].update({'status': 'open', 'pending_exit_order_id': None, 'pending_exit_order_placed_at': None, 'exit_reason_for_order': None})
-            else: # 'pending_exit' but no order_id in positions.json (unusual)
-                logger.log_action(f"Position {ticker} 'pending_exit' but no order_id in positions.json. Checking Alpaca for open exit.")
-                if ticker in alpaca_open_orders_map:
-                    expected_exit_side = 'sell' if details.get('type', 'long') == 'long' else 'buy'
-                    for open_order in alpaca_open_orders_map[ticker]:
-                        if open_order.side == expected_exit_side:
-                            logger.log_action(f"Found matching open exit {open_order.id} on Alpaca for {ticker}. Updating positions.json.")
-                            current_positions[ticker]['pending_exit_order_id'] = open_order.id
-                            break
-    position_manager.save_positions(current_positions)
-    current_positions = position_manager.load_positions() # Reload for consistent state
+                    logger.log_action(f"Trading Bot (initial_exit_check): Could not get status for known pending exit {known_exit_order_id} ({ticker}). Assuming inactive for now, reverting to 'open'.")
+                    positions_after_exit_check[ticker].update({'status': 'open', 'pending_exit_order_id': None, 'pending_exit_order_placed_at': None, 'exit_reason_for_order': None})
+                    any_positions_changed_by_exit_check = True
+                    if known_exit_order_id in current_pending_orders:
+                        del current_pending_orders[known_exit_order_id]
+            else: # 'pending_exit' but no order_id (should be rare after sync)
+                logger.log_action(f"Trading Bot (initial_exit_check): Position {ticker} 'pending_exit' but no order_id. Checking Alpaca for open exit order.")
+                # This case should ideally be resolved by sync_positions_from_alpaca or earlier checks
+                # If still here, might revert to 'open' or try to find matching order
+                # For now, let check_and_manage_open_positions handle it if it persists.
 
-    # Step 2: Fetch Market Data
-    logger.log_action("Step 2: Fetching market data...")
+    current_positions = positions_after_exit_check # Update current_positions with results of this check
+    if any_positions_changed_by_exit_check:
+        position_manager.save_positions(current_positions) # Save if changes were made
+        save_pending_orders(current_pending_orders) # Save if changes were made
+
+
+    # --- Step 2: Fetch Market Data ---
+    logger.log_action("Step 2: Fetching market data (historical and latest prices)...")
     historical_data_multi_df = data_fetcher.get_historical_data(
         config.TICKERS, timeframe='1Day',
         limit_per_ticker=config.Z_SCORE_WINDOW + 20, # Buffer for NaNs
@@ -200,14 +247,29 @@ def main():
             except KeyError:
                  logger.log_action(f"KeyError accessing hist data for {ticker_sym}.")
 
-    # Step 3: Manage Open Positions (Check for Exits)
+    # --- Step 3: Manage Open Positions (Check for Exits) ---
     logger.log_action("Step 3: Managing open positions for potential exits...")
-    position_manager.check_and_manage_open_positions(
-        latest_prices, historical_data_map_for_pm, api, alpaca_open_orders_map, alpaca_open_positions_map
+    # Pass the authoritative `current_positions` and `alpaca_live_positions_map` (which is alpaca_open_positions_map)
+    # Also pass `alpaca_open_orders_map_for_pm` for checking existing exit orders
+    positions_after_management = position_manager.check_and_manage_open_positions(
+        current_positions, # This is the synced and authoritative set of positions
+        latest_prices,
+        historical_data_map_for_pm,
+        api,
+        alpaca_open_orders_map_for_pm, # Map of open orders by ticker
+        alpaca_live_positions_map      # Map of live Alpaca positions by ticker
     )
-    current_positions = position_manager.load_positions() # Reload after potential status changes
+    # If check_and_manage_open_positions modified the dictionary, it returned a new one.
+    # Update current_positions and save if it changed.
+    if id(positions_after_management) != id(current_positions) or positions_after_management != current_positions:
+        logger.log_action("Trading Bot: Positions dictionary updated by check_and_manage_open_positions. Saving.")
+        current_positions = positions_after_management
+        position_manager.save_positions(current_positions)
+    else:
+        logger.log_action("Trading Bot: No changes to positions dictionary from check_and_manage_open_positions.")
 
-    # Step 4: Evaluate New Entry Signals
+
+    # --- Step 4: Evaluate New Entry Signals ---
     logger.log_action("Step 4: Evaluating new entry signals...")
     available_cash = position_manager.get_available_cash(api)
     logger.log_action(f"Available cash for new entries: ${available_cash:.2f}")
@@ -217,9 +279,10 @@ def main():
         logger.log_action(f"PDT count from Alpaca API: {pdt_count}")
     except Exception as e:
         logger.log_action(f"Could not get PDT count from Alpaca API: {e}. Using CSV method.")
-        pdt_count = position_manager.get_pdt_trade_count()
+        pdt_count = position_manager.get_pdt_trade_count() # This is a placeholder in position_manager
 
-    pending_orders = load_pending_orders() # Load current state of bot-tracked pending orders
+    # `current_pending_orders` is already up-to-date from initial sync.
+    # `current_positions` is also up-to-date.
 
     for ticker_symbol in config.TICKERS:
         current_price = latest_prices.get(ticker_symbol)
@@ -227,10 +290,15 @@ def main():
             logger.log_action(f"Invalid/missing price for {ticker_symbol} ({current_price}); skipping entry.")
             continue
         if ticker_symbol in current_positions and current_positions[ticker_symbol].get('status') in ['open', 'pending_exit']:
-            logger.log_action(f"Active or pending_exit position for {ticker_symbol}. Skipping new entry.")
+            logger.log_action(f"Trading Bot (new_entry_eval): Active or pending_exit position for {ticker_symbol}. Skipping new entry.")
             continue
-        if ticker_symbol in alpaca_open_orders_map: # Avoid duplicate entry if Alpaca shows open order
-            logger.log_action(f"Existing open Alpaca order(s) for {ticker_symbol}. Skipping new entry.")
+
+        # Check against `alpaca_open_orders_map_for_pm` (which is up-to-date) instead of the older `alpaca_open_orders_map`
+        if ticker_symbol in alpaca_open_orders_map_for_pm:
+            # More specific check: is there an OPEN BUY/SELL order (not an exit for a short/long)
+            # This check might be too broad if `alpaca_open_orders_map_for_pm` includes exit orders for other strategies.
+            # For now, assume any open order for the ticker means no new entry.
+            logger.log_action(f"Trading Bot (new_entry_eval): Existing open Alpaca order(s) for {ticker_symbol} in alpaca_open_orders_map_for_pm. Skipping new entry.")
             continue
 
         ticker_hist_data_df = historical_data_map_for_pm.get(ticker_symbol)
@@ -267,85 +335,145 @@ def main():
             entry_order = order_manager.place_limit_order(ticker_symbol, qty, current_price, order_side, api_client=api)
 
             if entry_order and hasattr(entry_order, 'id'):
-                logger.log_action(f"Entry order {entry_order.id} ({order_side} {qty} {ticker_symbol}) placed. Status: {entry_order.status}")
-                pending_orders[entry_order.id] = {
+                logger.log_action(f"Trading Bot: Entry order {entry_order.id} ({order_side} {qty} {ticker_symbol}) placed. Status: {entry_order.status}")
+                # Add to current_pending_orders immediately and save
+                current_pending_orders[entry_order.id] = {
                     "ticker": ticker_symbol, "qty": qty, "side": order_side, "limit_price": current_price,
                     "type": "entry_long" if signal == "BUY" else "entry_short",
                     "placed_at": datetime.now().isoformat(), "z_at_placement": current_z_score,
-                    "status": entry_order.status
+                    "status": entry_order.status # Initial status from Alpaca
                 }
-                available_cash -= (qty * current_price)
+                save_pending_orders(current_pending_orders) # Save updated pending orders
+                available_cash -= (qty * current_price) # Decrement available cash (approximate)
             else:
-                logger.log_action(f"Failed to place entry order for {ticker_symbol}.")
+                logger.log_action(f"Trading Bot: Failed to place entry order for {ticker_symbol}.")
 
-    # Step 5: Reconcile all bot-tracked pending_orders with Alpaca
-    logger.log_action("Step 5: Reconciling all pending_orders.json with Alpaca...")
-    filled_any_new_entries = False
-    alpaca_current_open_orders_list = order_manager.get_open_orders(api_client=api) # Fresh fetch
-    alpaca_current_open_orders_map_by_id = {order.id: order for order in alpaca_current_open_orders_list}
-    orders_to_remove_from_pending_file = []
+    # --- Step 5: Final Reconciliation of Pending Orders and Positions ---
+    logger.log_action("Step 5: Final reconciliation of all pending orders and resulting positions...")
+    any_new_entries_filled_this_cycle = False
 
-    for order_id, order_details in list(pending_orders.items()):
+    # Re-fetch live open orders to get the very latest status from Alpaca
+    final_alpaca_live_open_orders_list = order_manager.get_open_orders(api_client=api)
+    final_alpaca_live_open_orders_map_by_id = {order.id: order for order in final_alpaca_live_open_orders_list}
+
+    orders_to_remove_from_current_pending = []
+
+    for order_id, order_details in list(current_pending_orders.items()): # Iterate copy for safe modification
         ticker = order_details['ticker']
-        order_type = order_details['type']
+        order_type = order_details['type'] # e.g. "entry_long", "entry_short", "alpaca_sync_buy"
 
-        if order_id in alpaca_current_open_orders_map_by_id: # Still open on Alpaca
-            order_status_obj = alpaca_current_open_orders_map_by_id[order_id]
-            logger.log_action(f"Pending order {order_id} ({ticker}, {order_type}) still '{order_status_obj.status}' on Alpaca.")
-            pending_orders[order_id]['status'] = order_status_obj.status # Update local status
-        else: # Not in Alpaca's open list; must be filled, cancelled, expired, etc.
-            logger.log_action(f"Pending order {order_id} ({ticker}, {order_type}) not in Alpaca open orders. Checking final status...")
-            order_status_obj = order_manager.get_order_status(order_id, api_client=api)
+        if order_id in final_alpaca_live_open_orders_map_by_id: # Still open on Alpaca
+            alpaca_order_obj = final_alpaca_live_open_orders_map_by_id[order_id]
+            if current_pending_orders[order_id]['status'] != alpaca_order_obj.status:
+                logger.log_action(f"Trading Bot (final_recon): Pending order {order_id} ({ticker}, {order_type}) status updated on Alpaca to '{alpaca_order_obj.status}'. Was '{current_pending_orders[order_id]['status']}'.")
+                current_pending_orders[order_id]['status'] = alpaca_order_obj.status
+            # else: status is the same, no action needed other than keeping it in current_pending_orders
+        else: # Not in Alpaca's latest open list; must be filled, cancelled, expired, etc.
+            logger.log_action(f"Trading Bot (final_recon): Pending order {order_id} ({ticker}, {order_type}) not in Alpaca's latest open orders. Checking final status...")
+            final_status_obj = order_manager.get_order_status(order_id, api_client=api)
 
-            if order_status_obj:
-                if order_status_obj.status == 'filled':
+            if final_status_obj:
+                logger.log_action(f"Trading Bot (final_recon): Final status for order {order_id} ({ticker}) is '{final_status_obj.status}'.")
+                if final_status_obj.status == 'filled':
                     try:
-                        fill_price = float(order_status_obj.filled_avg_price)
-                        fill_qty = float(order_status_obj.filled_qty if order_status_obj.filled_qty is not None else order_details['qty'])
-                        logger.log_action(f"Pending order {order_id} ({ticker}, {order_type}) FILLED. Qty: {fill_qty}, Price: ${fill_price}.")
+                        fill_price = float(final_status_obj.filled_avg_price)
+                        # Use original order_details['qty'] as authority for intended quantity
+                        fill_qty = float(order_details['qty'])
+                        if hasattr(final_status_obj, 'filled_qty') and final_status_obj.filled_qty is not None:
+                             # Log if Alpaca's filled_qty differs, but proceed with original order's qty for position sizing
+                            if abs(float(final_status_obj.filled_qty) - fill_qty) > 0.001 :
+                                logger.log_action(f"Trading Bot (final_recon): Filled qty discrepancy for order {order_id}. Alpaca: {final_status_obj.filled_qty}, Expected: {fill_qty}. Using expected qty for position.")
 
-                        if order_type.startswith('entry') or order_type.startswith('alpaca_external_'):
-                            entry_fill_time = pd.to_datetime(order_status_obj.filled_at).to_pydatetime() if hasattr(order_status_obj, 'filled_at') and order_status_obj.filled_at else datetime.now()
-                            pos_type = 'long' if order_type == 'entry_long' or order_type == 'alpaca_external_buy' else ('short' if order_type == 'entry_short' or order_type == 'alpaca_external_sell' else None)
-                            if pos_type:
-                                position_manager.add_position(ticker, fill_qty, fill_price, pos_type, order_id, entry_fill_time)
-                                filled_any_new_entries = True
-                            else:
-                                logger.log_action(f"WARNING: Unknown position type for filled order {order_id} (type: {order_type}).")
-                        elif order_type.startswith('exit'): # Should be handled by position_manager now, but as a safeguard
-                            exit_reason = order_details.get('exit_reason_for_order', 'reconciled_exit_filled')
-                            position_manager.remove_position(ticker, fill_price, exit_reason, order_id)
-                        orders_to_remove_from_pending_file.append(order_id)
-                    except (ValueError, TypeError) as conv_err:
-                        logger.log_action(f"Error converting fill data for pending {order_id} ({ticker}, {order_type}): {conv_err}. Data: {order_status_obj}")
+                        logger.log_action(f"Trading Bot (final_recon): Order {order_id} ({ticker}, {order_type}) FILLED. Qty: {fill_qty}, Price: ${fill_price:.2f}.")
+
+                        # Determine position type based on original order intention
+                        pos_type_from_order = None
+                        if order_type.startswith('entry_long') or (order_type.startswith('alpaca_sync') and order_details['side'] == 'buy'):
+                            pos_type_from_order = 'long'
+                        elif order_type.startswith('entry_short') or (order_type.startswith('alpaca_sync') and order_details['side'] == 'sell'):
+                            pos_type_from_order = 'short'
+
+                        if pos_type_from_order:
+                            entry_fill_time = datetime.now() # Default
+                            if hasattr(final_status_obj, 'filled_at') and final_status_obj.filled_at:
+                                try:
+                                    filled_at_val = final_status_obj.filled_at
+                                    if isinstance(filled_at_val, str): entry_fill_time = pd.to_datetime(filled_at_val).to_pydatetime()
+                                    elif isinstance(filled_at_val, datetime): entry_fill_time = filled_at_val
+                                    elif hasattr(filled_at_val, 'isoformat'): entry_fill_time = datetime.fromisoformat(filled_at_val.isoformat())
+                                except Exception as e_ts:
+                                     logger.log_action(f"Trading Bot (final_recon): Error parsing filled_at for order {order_id}: {e_ts}. Using current time.")
+
+                            # Add to our `current_positions` dictionary
+                            current_positions = position_manager.add_position(current_positions, ticker, fill_qty, fill_price, pos_type_from_order, order_id, entry_fill_time)
+                            any_new_entries_filled_this_cycle = True
+                            logger.log_action(f"Trading Bot (final_recon): Added new position for {ticker} from filled order {order_id}.")
+                        else:
+                            logger.log_action(f"Trading Bot (final_recon): WARNING - Unknown effective position type for filled order {order_id} (type: {order_type}, side: {order_details['side']}). Not adding position automatically.")
+
+                        orders_to_remove_from_current_pending.append(order_id)
                     except Exception as ex:
-                        logger.log_action(f"Unexpected error processing filled pending {order_id} ({ticker}, {order_type}): {ex}")
-                elif order_status_obj.status in ['expired', 'canceled', 'rejected', 'done_for_day']:
-                    logger.log_action(f"Pending order {order_id} ({ticker}, {order_type}) is {order_status_obj.status}. Removing.")
-                    orders_to_remove_from_pending_file.append(order_id)
-                else:
-                    logger.log_action(f"Pending order {order_id} ({ticker}, {order_type}) still '{order_status_obj.status}'.") # e.g. 'new', 'accepted'
-            else: # Could not get status
-                logger.log_action(f"Could not get status for pending {order_id} ({ticker}, {order_type}). Assuming inactive, removing.")
-                orders_to_remove_from_pending_file.append(order_id)
+                        logger.log_action(f"Trading Bot (final_recon): Error processing filled order {order_id} ({ticker}, {order_type}): {ex}. Order details: {vars(final_status_obj)}")
+                elif final_status_obj.status in ['expired', 'canceled', 'rejected', 'done_for_day']:
+                    logger.log_action(f"Trading Bot (final_recon): Order {order_id} ({ticker}, {order_type}) is '{final_status_obj.status}'. Removing from pending list.")
+                    orders_to_remove_from_current_pending.append(order_id)
+                else: # e.g. 'new', 'accepted', 'pending_cancel' - should ideally not happen if not in open list, but log
+                    logger.log_action(f"Trading Bot (final_recon): Order {order_id} ({ticker}, {order_type}) has status '{final_status_obj.status}' but was not in open list. Keeping in pending for now.")
+                    current_pending_orders[order_id]['status'] = final_status_obj.status # Update status
+            else: # Could not get status from Alpaca for an order not in the open list
+                logger.log_action(f"Trading Bot (final_recon): Could not get final status for pending order {order_id} ({ticker}, {order_type}). Assuming inactive, removing from pending list.")
+                orders_to_remove_from_current_pending.append(order_id)
 
-    for oid in orders_to_remove_from_pending_file:
-        if oid in pending_orders: del pending_orders[oid]
+    # Process removals from current_pending_orders
+    if orders_to_remove_from_current_pending:
+        for oid in orders_to_remove_from_current_pending:
+            if oid in current_pending_orders:
+                del current_pending_orders[oid]
+        logger.log_action(f"Trading Bot (final_recon): Removed {len(orders_to_remove_from_current_pending)} orders from active pending list.")
 
-    save_pending_orders(pending_orders)
-    save_run_pending_orders_snapshot(pending_orders)
+    # Save the final state of pending orders and positions for this run
+    save_pending_orders(current_pending_orders)
+    save_run_pending_orders_snapshot(current_pending_orders) # Snapshot for this run
+    if any_new_entries_filled_this_cycle: # Also save positions if new ones were added
+        position_manager.save_positions(current_positions)
 
-    # TODO: Clarify this logic based on PENDING_ORDERS_FILE lifecycle (see README)
-    if os.path.exists(config.RUN_PENDING_ORDERS_FILE):
-        try:
-            os.remove(config.PENDING_ORDERS_FILE)
-            logger.log_action(f"Removed {config.PENDING_ORDERS_FILE} after snapshot.")
-        except OSError as e:
-            logger.log_action(f"Error removing {config.PENDING_ORDERS_FILE}: {e}")
 
-    if filled_any_new_entries:
-        logger.log_action("New positions opened. Re-running position management for immediate exit checks...")
-        position_manager.check_and_manage_open_positions(latest_prices, historical_data_map_for_pm, api)
+    # Optional: Clean up the main PENDING_ORDERS_FILE if snapshotting is the primary goal for historicals
+    # This depends on desired inter-run persistence strategy. For now, PENDING_ORDERS_FILE holds the latest known state.
+    # if os.path.exists(config.RUN_PENDING_ORDERS_FILE):
+    #     try:
+    #         # os.remove(config.PENDING_ORDERS_FILE) # Or clear it, or let it be overwritten next run's start
+    #         logger.log_action(f"Trading Bot: Main pending orders file {config.PENDING_ORDERS_FILE} retained with latest state.")
+    #     except OSError as e:
+    #         logger.log_action(f"Error related to {config.PENDING_ORDERS_FILE}: {e}")
+
+    if any_new_entries_filled_this_cycle:
+        logger.log_action("Trading Bot: New positions were opened. Re-running position management for immediate exit checks on these new positions...")
+        # Re-fetch latest prices if there could have been a significant delay
+        # latest_prices_for_final_check = data_fetcher.get_latest_prices(config.TICKERS, api_client=api)
+        # For simplicity, using existing latest_prices. In a real scenario, might re-fetch.
+
+        # Re-fetch open orders map as well, as new exits might have been placed by other logic if run concurrently (unlikely here)
+        final_alpaca_open_orders_list_for_pm_rerun = order_manager.get_open_orders(api_client=api, tickers=config.TICKERS)
+        final_alpaca_open_orders_map_for_pm_rerun = {order.symbol: [] for order in final_alpaca_open_orders_list_for_pm_rerun}
+        for order in final_alpaca_open_orders_list_for_pm_rerun:
+            final_alpaca_open_orders_map_for_pm_rerun[order.symbol].append(order)
+
+        # Re-fetch live positions map
+        final_alpaca_live_positions_map_rerun = data_fetcher.get_alpaca_open_positions(api_client=api)
+
+        positions_after_final_mgmt = position_manager.check_and_manage_open_positions(
+            current_positions, # Pass the latest `current_positions` which includes newly added ones
+            latest_prices, # Or latest_prices_for_final_check
+            historical_data_map_for_pm,
+            api,
+            final_alpaca_open_orders_map_for_pm_rerun,
+            final_alpaca_live_positions_map_rerun
+        )
+        if id(positions_after_final_mgmt) != id(current_positions) or positions_after_final_mgmt != current_positions:
+            logger.log_action("Trading Bot: Positions dictionary updated by final post-fill management. Saving.")
+            current_positions = positions_after_final_mgmt
+            position_manager.save_positions(current_positions)
 
     logger.log_action(f"===== Trading Bot session finished at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} =====\n")
 
